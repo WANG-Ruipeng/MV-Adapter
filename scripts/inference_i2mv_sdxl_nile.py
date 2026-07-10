@@ -91,9 +91,14 @@ def prepare_pipeline(
 
 def remove_bg(image, net, transform, device):
     image_size = image.size
-    input_images = transform(image).unsqueeze(0).to(device)
-    with torch.no_grad():
-        preds = net(input_images)[-1].sigmoid().cpu()
+    model_dtype = next(net.parameters()).dtype
+    input_images = (
+        transform(image.convert("RGB"))
+        .unsqueeze(0)
+        .to(device=device, dtype=model_dtype)
+    )
+    with torch.inference_mode():
+        preds = net(input_images)[-1].sigmoid().float().cpu()
     pred = preds[0].squeeze()
     pred_pil = transforms.ToPILImage()(pred)
     mask = pred_pil.resize(image_size)
