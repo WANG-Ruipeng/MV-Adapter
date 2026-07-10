@@ -18,3 +18,5 @@ timm
 kornia
 scikit-image
 sentencepiece
+jaxtyping
+typeguard>=2.13,<3

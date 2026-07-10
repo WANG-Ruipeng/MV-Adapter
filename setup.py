@@ -35,6 +35,8 @@ setup(
         "kornia",
         "scikit-image",
         "sentencepiece",
+        "jaxtyping",
+        "typeguard>=2.13,<3",
         "spandrel",
         "open3d",
         "pymeshlab",

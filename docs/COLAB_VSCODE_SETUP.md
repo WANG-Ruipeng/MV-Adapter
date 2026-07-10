@@ -63,9 +63,11 @@ MyDrive/
 默认 notebook 使用较省显存的 SD2.1：
 
 ```text
-stabilityai/stable-diffusion-2-1-base
+sd2-community/stable-diffusion-2-1-base
 mvadapter_t2mv_sd21.safetensors
 ```
+
+这里使用公开的 SD2.1 Diffusers 镜像，避免原 `stabilityai/stable-diffusion-2-1-base` 在未登录或未获授权时返回 401。两者模型结构相同。
 
 第一次运行会下载模型，之后复用 Drive 中的缓存。Drive 上直接加载大量小文件会比 Colab 本地盘慢，但不会因运行时回收而丢失。生成结果也直接写入 Drive。
 

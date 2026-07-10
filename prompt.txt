@@ -1,0 +1,1444 @@
+可以。**完整实验方案应该按“固定 MV-Adapter 权重，只替换随机轨迹生成器”来做**。我们不要一上来改 U-Net、attention processor 或 adapter 权重，而是在 MV-Adapter 的推理入口插入一个 **NILE sampler layer**，控制：
+
+[
+\text{view} \times \text{denoising timestep} \times \text{latent patch} \times \text{spatial frequency band}
+]
+
+上的随机结构。
+
+我建议主实验先用 **MV-Adapter Image-to-Multiview SDXL**，因为 image-conditioned 输入比 text-conditioned 输入更稳定，更容易判断一致性改善到底来自 sampler，而不是 prompt 语义随机性。MV-Adapter 官方定位本身就是 plug-and-play adapter，可以在不改变原 T2I 网络结构和 feature space 的情况下增强多视角生成；项目页也说明它由 condition guider 和 decoupled multi-view attention 组成，推理时可以插入已有 T2I 模型。([Zehuan Huang][1]) 官方 repo 提供 SDXL 768 分辨率 text/image-to-multiview、geometry-guided generation、推理脚本和权重，且 license 是 Apache-2.0。([GitHub][2])
+
+---
+
+# 1. 总体目标
+
+我们要验证的不是：
+
+> NILE 让 MV-Adapter 学会更强的 3D prior。
+
+而是：
+
+> 在 MV-Adapter 权重完全冻结的情况下，NILE 通过结构化 latent noise 和 denoising trajectory coupling，是否能进一步提升多视角一致性。
+
+也就是把 MV-Adapter 原本的机制分成两层：
+
+[
+\text{MV-Adapter：feature / attention consistency}
+]
+
+[
+\text{NILE-ViewTime：stochastic trajectory consistency}
+]
+
+这两个层级是互补的。MV-Adapter 已经在网络中做 multi-view attention，我们要做的是**把随机自由度本身编织成低偏差、局部连续、低频共享、高频解耦的结构**。
+
+---
+
+# 2. 为什么 MV-Adapter 很适合插 NILE
+
+MV-Adapter 的 SDXL I2MV pipeline 已经天然有两个关键插入口。
+
+第一，它的 `__call__` 接受外部 `latents: Optional[torch.FloatTensor]`，然后在 denoising 前通过 `prepare_latents(...)` 使用这些 latents；这意味着我们可以直接替换默认 IID Gaussian 初始噪声。([GitHub][3])
+
+第二，它支持 `callback_on_step_end`，并且 callback 可以拿到 `latents`，返回后 pipeline 会用 callback 输出的 `latents` 覆盖当前 latent state。([GitHub][3])
+
+所以完整 NILE 实验可以完全 training-free：
+
+```text
+MV-Adapter pretrained weights: frozen
+U-Net: frozen
+adapter: frozen
+condition encoder: frozen
+scheduler: fixed
+only latents / callback / sampler changed
+```
+
+这点非常重要，因为它让实验归因很干净。
+
+---
+
+# 3. 推荐目录结构
+
+在 MV-Adapter repo 里新增这些文件：
+
+```text
+MV-Adapter/
+  mvadapter/
+    nile/
+      __init__.py
+      ops.py                 # blur, standardize, frequency split
+      morton.py              # Morton / Z-index utilities
+      sequence.py            # Sobol backend now, SZ backend later
+      sampler.py             # initial latent samplers
+      callbacks.py           # denoising-step NILE coupling
+
+  scripts/
+    inference_i2mv_sdxl_nile.py
+    run_nile_grid.py
+    eval_multiview_consistency.py
+```
+
+第一版直接 fork `scripts/inference_i2mv_sdxl.py`，改成 `scripts/inference_i2mv_sdxl_nile.py`。MV-Adapter 官方 README 已经给出了 clone、环境安装和推理脚本入口；SDXL I2MV 约需要较高显存，README 标注 image-to-multiview 约 14GB GPU memory。([GitHub][2])
+
+---
+
+# 4. NILE-ViewTime 在 MV-Adapter 里的完整模块分解
+
+## 4.1 Element Bank 映射
+
+在 MV-Adapter 里，NILE 的低维元素可以这样定义：
+
+| NILE element | MV-Adapter 对应对象                     | 实现方式                                         |
+| ------------ | ----------------------------------- | -------------------------------------------- |
+| (E_V)        | 多视角 view index / azimuth sector     | view-wise latent coupling                    |
+| (E_T)        | denoising step index                | callback 中按 step 调整 coupling                 |
+| (E_P)        | latent patch                        | Morton / Z-index patch order                 |
+| (E_F)        | spatial frequency band              | low-pass geometry / high-pass texture split  |
+| (E_\epsilon) | initial noise / latent perturbation | IID / shared / Sobol / SZ Gaussian transform |
+
+注意这里我不建议第一版按 SDXL latent channel 做“几何通道 / 纹理通道”切分，因为 SDXL latent 只有 4 个 channel，很难证明哪个 channel 是 geometry。更稳的做法是做**空间频率切分**：
+
+[
+z = \mathrm{LP}(z) + \mathrm{HP}(z)
+]
+
+其中：
+
+* (\mathrm{LP}(z))：低频，主要影响大形体、轮廓、跨视角几何；
+* (\mathrm{HP}(z))：高频，主要影响纹理、局部细节、随机残差。
+
+---
+
+# 5. 三阶段实现路线
+
+完整实验不要一次做完。建议拆成 3 个递进版本。
+
+---
+
+## 阶段 A：NILE-V，只改初始 latent
+
+这是最小可行版本，也是第一轮必须先做的实验。
+
+核心思想：
+
+[
+z_v =
+\rho_{\text{geo}} \cdot z_{\text{shared}}^{LP}
++
+\sqrt{1-\rho_{\text{geo}}^2}
+\cdot z_{v}^{HP}
+]
+
+其中：
+
+* 所有视角共享低频父 latent；
+* 每个视角保留独立高频 residual；
+* 最后重新标准化，尽量保持 latent marginal 接近标准 Gaussian。
+
+这个版本回答一个最基本问题：
+
+> 只在初始 latent 上做低频共享，是否已经能提升 MV-Adapter 的多视角一致性？
+
+如果这个版本都没有信号，后面的 VT / VTP 不值得继续大做。
+
+---
+
+## 阶段 B：NILE-VT，加入 denoising step callback
+
+第二阶段在每个 denoising step 末尾轻微耦合多视角 latent。
+
+关键原则：
+
+```text
+早期 denoising：强一点低频共享，因为此时决定大形体。
+中期 denoising：逐渐减弱共享，避免过度锁死。
+后期 denoising：基本关闭共享，让纹理和细节自由生成。
+```
+
+可以设：
+
+[
+\rho(i)=
+\rho_0
+\left(
+1-\frac{i}{\alpha K}
+\right),
+\quad i < \alpha K
+]
+
+[
+\rho(i)=0,
+\quad i \geq \alpha K
+]
+
+其中 (K) 是总 step 数，(\alpha) 可以取 0.5–0.7。
+
+这个版本验证：
+
+> 静态 initial coupling 之外，动态去噪轨迹 coupling 是否进一步减少 view drift？
+
+---
+
+## 阶段 C：NILE-VTP，加入 Time-View-Patch Z-index
+
+第三阶段才加入完整的 Z-index patch structure。
+
+核心 key：
+
+[
+i = \mathrm{Morton}(b_t, b_v, b_p)
+]
+
+其中：
+
+* (b_t)：denoising step bucket；
+* (b_v)：view sector；
+* (b_p)：latent patch Morton index。
+
+这个 key 用来索引低差异序列：
+
+[
+u_i = \mathrm{SZ}(i)
+]
+
+再把 (u_i) 映射成局部 coupling strength、patch mask 或 Gaussian perturbation。
+
+严格的 NILE 版本最终应该使用 SZ sequence。SZ 论文说明它可以把多个低维序列嵌入 / ensemble 到更高 power-of-two 维度，并且其 binary generator matrices 可以作为 Sobol matrices 的 drop-in replacement。([arXiv][4]) 但工程第一版可以先用 PyTorch `SobolEngine(scramble=True)` 做原型，因为 PyTorch 官方提供 scrambled Sobol low-discrepancy sequence engine，方便快速验证。([PyTorch Documentation][5]) 最终论文实验里要把 “Flat Sobol” 放 baseline，把 “NILE/SZ” 放完整方法。
+
+---
+
+# 6. 核心代码设计
+
+下面这套代码是可以直接落地成 `mvadapter/nile/` 模块的结构。
+
+---
+
+## 6.1 `ops.py`
+
+```python
+# mvadapter/nile/ops.py
+
+import math
+import torch
+import torch.nn.functional as F
+
+
+def standardize_like(x: torch.Tensor, ref: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
+    """
+    Match per-sample mean/std of x to ref.
+    This is important because diffusion schedulers expect latents to stay near
+    the original noise scale.
+    """
+    dims = tuple(range(1, x.ndim))
+    x_mean = x.mean(dim=dims, keepdim=True)
+    x_std = x.std(dim=dims, keepdim=True).clamp_min(eps)
+
+    ref_mean = ref.mean(dim=dims, keepdim=True)
+    ref_std = ref.std(dim=dims, keepdim=True).clamp_min(eps)
+
+    return (x - x_mean) / x_std * ref_std + ref_mean
+
+
+def standardize_unit(x: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
+    dims = tuple(range(1, x.ndim))
+    return (x - x.mean(dim=dims, keepdim=True)) / (
+        x.std(dim=dims, keepdim=True).clamp_min(eps)
+    )
+
+
+def gaussian_blur_latent(
+    x: torch.Tensor,
+    kernel_size: int = 11,
+    sigma: float = 2.5,
+) -> torch.Tensor:
+    """
+    Depthwise separable Gaussian blur for latent tensors.
+    x: [B, C, H, W]
+    """
+    assert kernel_size % 2 == 1, "kernel_size must be odd"
+
+    radius = kernel_size // 2
+    grid = torch.arange(kernel_size, device=x.device, dtype=x.dtype) - radius
+    kernel_1d = torch.exp(-(grid ** 2) / (2 * sigma ** 2))
+    kernel_1d = kernel_1d / kernel_1d.sum()
+
+    kernel_x = kernel_1d.view(1, 1, 1, kernel_size)
+    kernel_y = kernel_1d.view(1, 1, kernel_size, 1)
+
+    c = x.shape[1]
+
+    x_pad = F.pad(x, (radius, radius, 0, 0), mode="reflect")
+    x_blur = F.conv2d(
+        x_pad,
+        kernel_x.expand(c, 1, 1, kernel_size),
+        groups=c,
+    )
+
+    x_pad = F.pad(x_blur, (0, 0, radius, radius), mode="reflect")
+    x_blur = F.conv2d(
+        x_pad,
+        kernel_y.expand(c, 1, kernel_size, 1),
+        groups=c,
+    )
+
+    return x_blur
+
+
+def low_high_split(
+    x: torch.Tensor,
+    kernel_size: int = 11,
+    sigma: float = 2.5,
+):
+    low = gaussian_blur_latent(x, kernel_size=kernel_size, sigma=sigma)
+    high = x - low
+    return low, high
+```
+
+---
+
+## 6.2 `morton.py`
+
+```python
+# mvadapter/nile/morton.py
+
+import torch
+
+
+def part1by1(n: torch.Tensor) -> torch.Tensor:
+    """
+    Interleave bits of a 16-bit integer with zeros.
+    Works on torch int64 tensors.
+    """
+    n = n & 0x0000ffff
+    n = (n | (n << 8)) & 0x00FF00FF
+    n = (n | (n << 4)) & 0x0F0F0F0F
+    n = (n | (n << 2)) & 0x33333333
+    n = (n | (n << 1)) & 0x55555555
+    return n
+
+
+def morton2d(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+    return part1by1(x) | (part1by1(y) << 1)
+
+
+def patch_morton_order(h: int, w: int, patch_size: int, device: str):
+    """
+    Return patch coordinates sorted by Morton order.
+    h, w are latent height/width.
+    """
+    ph = h // patch_size
+    pw = w // patch_size
+
+    ys, xs = torch.meshgrid(
+        torch.arange(ph, device=device, dtype=torch.long),
+        torch.arange(pw, device=device, dtype=torch.long),
+        indexing="ij",
+    )
+
+    codes = morton2d(xs.reshape(-1), ys.reshape(-1))
+    order = torch.argsort(codes)
+
+    coords = torch.stack([ys.reshape(-1), xs.reshape(-1)], dim=-1)
+    return coords[order]  # [num_patches, 2]
+```
+
+---
+
+## 6.3 `sequence.py`
+
+```python
+# mvadapter/nile/sequence.py
+
+import math
+import torch
+
+
+def inverse_normal_cdf(u: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
+    """
+    Transform uniform [0, 1] samples into approximate standard Gaussian samples.
+    """
+    u = u.clamp(eps, 1.0 - eps)
+    return math.sqrt(2.0) * torch.erfinv(2.0 * u - 1.0)
+
+
+class SobolBackend:
+    """
+    Prototype backend.
+    In the final strict NILE/SZ implementation, replace this with SZ matrices.
+    """
+    def __init__(self, dim: int, scramble: bool = True, seed: int = 0):
+        self.dim = dim
+        self.scramble = scramble
+        self.seed = seed
+        self.engine = torch.quasirandom.SobolEngine(
+            dimension=dim,
+            scramble=scramble,
+            seed=seed,
+        )
+
+    def draw(self, n: int, device, dtype=torch.float32) -> torch.Tensor:
+        u = self.engine.draw(n).to(device=device, dtype=dtype)
+        return u
+
+
+class SZBackend:
+    """
+    Placeholder interface for strict NILE/SZ.
+    Implement with SZ binary generator matrices when available.
+    Keep the same draw(n, device, dtype) API as SobolBackend.
+    """
+    def __init__(self, dim: int, seed: int = 0):
+        self.dim = dim
+        self.seed = seed
+        raise NotImplementedError(
+            "Replace SobolBackend with SZ binary matrices for the final NILE/SZ backend."
+        )
+```
+
+这里我故意把 `SobolBackend` 和 `SZBackend` 分开。原因是论文实验里必须有：
+
+```text
+Flat Sobol baseline
+NILE/SZ full method
+```
+
+不能把 Sobol prototype 直接叫最终 NILE。NILE 官方摘要强调的是 local samplers + high-dimensional low-discrepancy sequence + power-of-two hierarchical intervals 的 meta-sampler；所以最终版本要有 element bank、interval hierarchy 和 Z-index，而不只是一个 Sobol tensor。([NVIDIA][6])
+
+---
+
+# 7. 初始 latent sampler
+
+## 7.1 `sampler.py`
+
+```python
+# mvadapter/nile/sampler.py
+
+from dataclasses import dataclass
+from typing import Literal, Optional
+
+import torch
+
+from .ops import (
+    gaussian_blur_latent,
+    low_high_split,
+    standardize_unit,
+    standardize_like,
+)
+from .sequence import SobolBackend, inverse_normal_cdf
+
+
+SamplerMode = Literal[
+    "iid",
+    "shared",
+    "lowpass_shared",
+    "flat_sobol",
+    "nile_v",
+    "nile_vtp",
+]
+
+
+@dataclass
+class NILEConfig:
+    mode: SamplerMode = "nile_v"
+    seed: int = 0
+    rho_geo: float = 0.65
+    blur_kernel: int = 11
+    blur_sigma: float = 2.5
+    patch_size: int = 8
+    qmc_scramble: bool = True
+    qmc_dim: int = 4
+
+
+def make_iid_latents(
+    batch_size: int,
+    num_views: int,
+    channels: int,
+    latent_h: int,
+    latent_w: int,
+    device,
+    dtype,
+    seed: int,
+):
+    g = torch.Generator(device=device).manual_seed(seed)
+    return torch.randn(
+        batch_size * num_views,
+        channels,
+        latent_h,
+        latent_w,
+        generator=g,
+        device=device,
+        dtype=dtype,
+    )
+
+
+def make_shared_latents(
+    batch_size: int,
+    num_views: int,
+    channels: int,
+    latent_h: int,
+    latent_w: int,
+    device,
+    dtype,
+    seed: int,
+):
+    g = torch.Generator(device=device).manual_seed(seed)
+    z = torch.randn(
+        batch_size,
+        channels,
+        latent_h,
+        latent_w,
+        generator=g,
+        device=device,
+        dtype=dtype,
+    )
+    z = z[:, None].repeat(1, num_views, 1, 1, 1)
+    return z.reshape(batch_size * num_views, channels, latent_h, latent_w)
+
+
+def make_flat_sobol_latents(
+    batch_size: int,
+    num_views: int,
+    channels: int,
+    latent_h: int,
+    latent_w: int,
+    device,
+    dtype,
+    seed: int,
+):
+    """
+    Baseline: flat Sobol directly generates the whole latent tensor.
+    This is not NILE, because it has no element-aware view/time/patch hierarchy.
+    """
+    total = batch_size * num_views * channels * latent_h * latent_w
+
+    backend = SobolBackend(dim=1, scramble=True, seed=seed)
+    u = backend.draw(total, device=device, dtype=torch.float32).reshape(-1)
+
+    z = inverse_normal_cdf(u).to(device=device, dtype=dtype)
+    z = z.reshape(batch_size * num_views, channels, latent_h, latent_w)
+    return standardize_unit(z)
+
+
+def make_lowpass_shared_latents(
+    batch_size: int,
+    num_views: int,
+    channels: int,
+    latent_h: int,
+    latent_w: int,
+    device,
+    dtype,
+    seed: int,
+    rho_geo: float = 0.65,
+    blur_kernel: int = 11,
+    blur_sigma: float = 2.5,
+):
+    """
+    Strong baseline:
+    low-frequency shared parent + high-frequency independent child.
+    No NILE/SZ, no Z-index.
+    """
+    g = torch.Generator(device=device).manual_seed(seed)
+
+    parent = torch.randn(
+        batch_size,
+        channels,
+        latent_h,
+        latent_w,
+        generator=g,
+        device=device,
+        dtype=dtype,
+    )
+
+    local = torch.randn(
+        batch_size,
+        num_views,
+        channels,
+        latent_h,
+        latent_w,
+        generator=g,
+        device=device,
+        dtype=dtype,
+    )
+
+    parent_low = gaussian_blur_latent(
+        parent,
+        kernel_size=blur_kernel,
+        sigma=blur_sigma,
+    )
+    parent_low = standardize_unit(parent_low)[:, None]
+
+    local_flat = local.reshape(batch_size * num_views, channels, latent_h, latent_w)
+    local_low, local_high = low_high_split(
+        local_flat,
+        kernel_size=blur_kernel,
+        sigma=blur_sigma,
+    )
+    local_high = standardize_unit(local_high)
+    local_high = local_high.reshape(
+        batch_size,
+        num_views,
+        channels,
+        latent_h,
+        latent_w,
+    )
+
+    z = rho_geo * parent_low + (1.0 - rho_geo ** 2) ** 0.5 * local_high
+    z = z.reshape(batch_size * num_views, channels, latent_h, latent_w)
+    return standardize_unit(z)
+
+
+def make_nile_v_latents(
+    batch_size: int,
+    num_views: int,
+    channels: int,
+    latent_h: int,
+    latent_w: int,
+    device,
+    dtype,
+    cfg: NILEConfig,
+):
+    """
+    NILE-V prototype:
+    same low/high structure as lowpass_shared, but view children are generated
+    using a low-discrepancy sequence rather than pure IID.
+    """
+    # shared parent remains Gaussian random
+    g = torch.Generator(device=device).manual_seed(cfg.seed)
+    parent = torch.randn(
+        batch_size,
+        channels,
+        latent_h,
+        latent_w,
+        generator=g,
+        device=device,
+        dtype=dtype,
+    )
+
+    parent_low = gaussian_blur_latent(
+        parent,
+        kernel_size=cfg.blur_kernel,
+        sigma=cfg.blur_sigma,
+    )
+    parent_low = standardize_unit(parent_low)[:, None]
+
+    # QMC view-local noise
+    total = batch_size * num_views * channels * latent_h * latent_w
+    backend = SobolBackend(dim=1, scramble=cfg.qmc_scramble, seed=cfg.seed + 17)
+    u = backend.draw(total, device=device, dtype=torch.float32).reshape(-1)
+    local = inverse_normal_cdf(u).to(device=device, dtype=dtype)
+    local = local.reshape(batch_size * num_views, channels, latent_h, latent_w)
+
+    local_low, local_high = low_high_split(
+        local,
+        kernel_size=cfg.blur_kernel,
+        sigma=cfg.blur_sigma,
+    )
+    local_high = standardize_unit(local_high)
+    local_high = local_high.reshape(
+        batch_size,
+        num_views,
+        channels,
+        latent_h,
+        latent_w,
+    )
+
+    z = cfg.rho_geo * parent_low + (1.0 - cfg.rho_geo ** 2) ** 0.5 * local_high
+    z = z.reshape(batch_size * num_views, channels, latent_h, latent_w)
+    return standardize_unit(z)
+
+
+def make_initial_latents(
+    batch_size: int,
+    num_views: int,
+    channels: int,
+    latent_h: int,
+    latent_w: int,
+    device,
+    dtype,
+    cfg: NILEConfig,
+):
+    if cfg.mode == "iid":
+        return make_iid_latents(
+            batch_size, num_views, channels, latent_h, latent_w, device, dtype, cfg.seed
+        )
+
+    if cfg.mode == "shared":
+        return make_shared_latents(
+            batch_size, num_views, channels, latent_h, latent_w, device, dtype, cfg.seed
+        )
+
+    if cfg.mode == "flat_sobol":
+        return make_flat_sobol_latents(
+            batch_size, num_views, channels, latent_h, latent_w, device, dtype, cfg.seed
+        )
+
+    if cfg.mode == "lowpass_shared":
+        return make_lowpass_shared_latents(
+            batch_size=batch_size,
+            num_views=num_views,
+            channels=channels,
+            latent_h=latent_h,
+            latent_w=latent_w,
+            device=device,
+            dtype=dtype,
+            seed=cfg.seed,
+            rho_geo=cfg.rho_geo,
+            blur_kernel=cfg.blur_kernel,
+            blur_sigma=cfg.blur_sigma,
+        )
+
+    if cfg.mode in ["nile_v", "nile_vtp"]:
+        return make_nile_v_latents(
+            batch_size=batch_size,
+            num_views=num_views,
+            channels=channels,
+            latent_h=latent_h,
+            latent_w=latent_w,
+            device=device,
+            dtype=dtype,
+            cfg=cfg,
+        )
+
+    raise ValueError(f"Unknown NILE sampler mode: {cfg.mode}")
+```
+
+---
+
+# 8. Denoising callback：NILE-VT / NILE-VTP
+
+## 8.1 `callbacks.py`
+
+```python
+# mvadapter/nile/callbacks.py
+
+from dataclasses import dataclass
+from typing import Literal
+
+import torch
+
+from .ops import low_high_split, standardize_like
+from .morton import patch_morton_order
+
+
+CallbackMode = Literal["none", "nile_vt", "nile_vtp"]
+
+
+@dataclass
+class NILECallbackConfig:
+    mode: CallbackMode = "nile_vt"
+    num_views: int = 6
+    batch_size: int = 1
+
+    rho_start: float = 0.45
+    rho_end: float = 0.0
+    active_ratio: float = 0.6
+
+    blur_kernel: int = 9
+    blur_sigma: float = 2.0
+
+    patch_size: int = 8
+    zindex_strength: float = 0.25
+
+    preserve_marginal: bool = True
+
+
+def linear_rho(step: int, total_steps: int, cfg: NILECallbackConfig) -> float:
+    active_steps = max(int(total_steps * cfg.active_ratio), 1)
+
+    if step >= active_steps:
+        return 0.0
+
+    alpha = step / active_steps
+    return cfg.rho_start * (1.0 - alpha) + cfg.rho_end * alpha
+
+
+def build_patch_rho_map(
+    h: int,
+    w: int,
+    patch_size: int,
+    base_rho: float,
+    zindex_strength: float,
+    device,
+    dtype,
+):
+    """
+    Build a patch-wise rho map using Morton order.
+    This is a lightweight stand-in for full Time-View-Patch SZ indexing.
+
+    Returns: [1, 1, 1, H, W]
+    """
+    rho_map = torch.full((h, w), base_rho, device=device, dtype=dtype)
+
+    coords = patch_morton_order(h, w, patch_size, device=device)
+    n = coords.shape[0]
+
+    if n <= 1:
+        return rho_map[None, None, None]
+
+    # Deterministic oscillation along Morton order.
+    # Later replace with SZ/Morton indexed low-discrepancy values.
+    idx = torch.arange(n, device=device, dtype=dtype)
+    phase = idx / max(n - 1, 1)
+    mod = 1.0 + zindex_strength * torch.sin(2.0 * torch.pi * phase)
+
+    for j, (py, px) in enumerate(coords):
+        y0 = int(py.item()) * patch_size
+        x0 = int(px.item()) * patch_size
+        rho_map[y0 : y0 + patch_size, x0 : x0 + patch_size] = base_rho * mod[j]
+
+    rho_map = rho_map.clamp(0.0, 1.0)
+    return rho_map[None, None, None]  # [1,1,1,H,W]
+
+
+class NILEViewTimeCallback:
+    """
+    Training-free latent trajectory coupling for MV-Adapter.
+
+    Expected latent shape:
+        [B * V, C, H, W]
+
+    The callback:
+        1. reshapes to [B, V, C, H, W]
+        2. splits low/high spatial frequencies
+        3. averages low-frequency component across views
+        4. blends per-view low frequency toward the shared parent
+        5. preserves high frequency
+        6. restores original marginal mean/std
+    """
+    def __init__(self, cfg: NILECallbackConfig):
+        self.cfg = cfg
+
+    def __call__(self, pipe, step: int, timestep: int, callback_kwargs: dict):
+        if self.cfg.mode == "none":
+            return callback_kwargs
+
+        latents = callback_kwargs["latents"]
+        ref = latents
+
+        bvc, c, h, w = latents.shape
+        v = self.cfg.num_views
+        assert bvc % v == 0, f"latent batch {bvc} not divisible by num_views {v}"
+
+        b = bvc // v
+        z = latents.reshape(b, v, c, h, w)
+
+        total_steps = getattr(pipe, "_num_timesteps", None)
+        if total_steps is None:
+            total_steps = 50
+
+        rho = linear_rho(step, total_steps, self.cfg)
+
+        if rho <= 1e-6:
+            return callback_kwargs
+
+        z_flat = z.reshape(b * v, c, h, w)
+
+        low, high = low_high_split(
+            z_flat,
+            kernel_size=self.cfg.blur_kernel,
+            sigma=self.cfg.blur_sigma,
+        )
+
+        low = low.reshape(b, v, c, h, w)
+        high = high.reshape(b, v, c, h, w)
+
+        parent_low = low.mean(dim=1, keepdim=True)
+
+        if self.cfg.mode == "nile_vtp":
+            rho_map = build_patch_rho_map(
+                h=h,
+                w=w,
+                patch_size=self.cfg.patch_size,
+                base_rho=rho,
+                zindex_strength=self.cfg.zindex_strength,
+                device=latents.device,
+                dtype=latents.dtype,
+            )
+            # rho_map: [1,1,1,H,W], broadcasts over [B,V,C,H,W]
+            low_new = (1.0 - rho_map) * low + rho_map * parent_low
+        else:
+            low_new = (1.0 - rho) * low + rho * parent_low
+
+        z_new = low_new + high
+        z_new = z_new.reshape(bvc, c, h, w)
+
+        if self.cfg.preserve_marginal:
+            z_new = standardize_like(z_new, ref)
+
+        callback_kwargs["latents"] = z_new.to(dtype=latents.dtype)
+        return callback_kwargs
+```
+
+这份 callback 做的是 **implicit low-frequency trajectory coupling**，不是 hard averaging。它不会把所有视角直接压成同一张图，而是只把低频部分向共享父轨迹靠近，并且 coupling 随 denoising step 衰减。
+
+---
+
+# 9. 修改 MV-Adapter 推理脚本
+
+在 `scripts/inference_i2mv_sdxl_nile.py` 里，基于官方 `inference_i2mv_sdxl.py` 增加参数和 sampler。
+
+MV-Adapter 官方脚本已经有 image-to-multiview demo 与推理入口，SDXL I2MV 默认通过 `scripts.gradio_demo_i2mv` 或推理脚本运行。([GitHub][2]) 我们只需要在 `pipe(...)` 前创建自定义 latents，再把 callback 传进去。
+
+核心修改如下：
+
+```python
+# scripts/inference_i2mv_sdxl_nile.py
+
+from mvadapter.nile.sampler import NILEConfig, make_initial_latents
+from mvadapter.nile.callbacks import NILECallbackConfig, NILEViewTimeCallback
+```
+
+在 `run_pipeline(...)` 增加参数：
+
+```python
+def run_pipeline(
+    pipe,
+    num_views,
+    text,
+    image,
+    height,
+    width,
+    num_inference_steps,
+    guidance_scale,
+    seed,
+    remove_bg_fn=None,
+    reference_conditioning_scale=1.0,
+    negative_prompt="watermark, ugly, deformed, noisy, blurry, low contrast",
+    lora_scale=1.0,
+    device="cuda",
+    azimuth_deg=None,
+
+    # NILE args
+    nile_mode="iid",
+    nile_callback="none",
+    rho_geo=0.65,
+    rho_start=0.45,
+    rho_end=0.0,
+    active_ratio=0.6,
+    blur_kernel=11,
+    blur_sigma=2.5,
+    patch_size=8,
+):
+```
+
+在 `pipe(...)` 调用前加入：
+
+```python
+batch_size = 1
+latent_h = height // pipe.vae_scale_factor
+latent_w = width // pipe.vae_scale_factor
+channels = pipe.unet.config.in_channels
+
+nile_cfg = NILEConfig(
+    mode=nile_mode,
+    seed=seed if seed != -1 else 0,
+    rho_geo=rho_geo,
+    blur_kernel=blur_kernel,
+    blur_sigma=blur_sigma,
+    patch_size=patch_size,
+)
+
+latents = make_initial_latents(
+    batch_size=batch_size,
+    num_views=num_views,
+    channels=channels,
+    latent_h=latent_h,
+    latent_w=latent_w,
+    device=device,
+    dtype=pipe.unet.dtype,
+    cfg=nile_cfg,
+)
+
+callback = None
+callback_inputs = ["latents"]
+
+if nile_callback != "none":
+    cb_cfg = NILECallbackConfig(
+        mode=nile_callback,
+        num_views=num_views,
+        batch_size=batch_size,
+        rho_start=rho_start,
+        rho_end=rho_end,
+        active_ratio=active_ratio,
+        blur_kernel=9,
+        blur_sigma=2.0,
+        patch_size=patch_size,
+    )
+    callback = NILEViewTimeCallback(cb_cfg)
+```
+
+然后把 `latents` 和 callback 传给 pipeline：
+
+```python
+images = pipe(
+    text,
+    height=height,
+    width=width,
+    num_inference_steps=num_inference_steps,
+    guidance_scale=guidance_scale,
+    num_images_per_prompt=num_views,
+    control_image=control_images,
+    control_conditioning_scale=1.0,
+    reference_image=reference_image,
+    reference_conditioning_scale=reference_conditioning_scale,
+    negative_prompt=negative_prompt,
+    cross_attention_kwargs={"scale": lora_scale},
+
+    # NILE injection
+    latents=latents,
+    callback_on_step_end=callback,
+    callback_on_step_end_tensor_inputs=callback_inputs,
+
+).images
+```
+
+注意：传入自定义 `latents` 后，最好不要再传 `generator` 控制默认 latent，否则 baseline 会混淆。`seed` 应该统一交给 NILE sampler 管理。
+
+---
+
+# 10. CLI 参数设计
+
+在 argparse 里加：
+
+```python
+parser.add_argument(
+    "--nile_mode",
+    type=str,
+    default="iid",
+    choices=[
+        "iid",
+        "shared",
+        "lowpass_shared",
+        "flat_sobol",
+        "nile_v",
+        "nile_vtp",
+    ],
+)
+
+parser.add_argument(
+    "--nile_callback",
+    type=str,
+    default="none",
+    choices=["none", "nile_vt", "nile_vtp"],
+)
+
+parser.add_argument("--rho_geo", type=float, default=0.65)
+parser.add_argument("--rho_start", type=float, default=0.45)
+parser.add_argument("--rho_end", type=float, default=0.0)
+parser.add_argument("--active_ratio", type=float, default=0.6)
+parser.add_argument("--blur_kernel", type=int, default=11)
+parser.add_argument("--blur_sigma", type=float, default=2.5)
+parser.add_argument("--patch_size", type=int, default=8)
+```
+
+示例命令：
+
+```bash
+python -m scripts.inference_i2mv_sdxl_nile \
+  --image examples/chair.png \
+  --text "high quality, detailed object" \
+  --seed 42 \
+  --azimuth_deg 0 45 90 180 270 315 \
+  --num_inference_steps 50 \
+  --guidance_scale 3.0 \
+  --nile_mode nile_v \
+  --nile_callback none \
+  --rho_geo 0.65 \
+  --output outputs/chair_nile_v.png
+```
+
+加入 VT callback：
+
+```bash
+python -m scripts.inference_i2mv_sdxl_nile \
+  --image examples/chair.png \
+  --text "high quality, detailed object" \
+  --seed 42 \
+  --azimuth_deg 0 45 90 180 270 315 \
+  --num_inference_steps 50 \
+  --guidance_scale 3.0 \
+  --nile_mode nile_v \
+  --nile_callback nile_vt \
+  --rho_geo 0.65 \
+  --rho_start 0.45 \
+  --active_ratio 0.6 \
+  --output outputs/chair_nile_vt.png
+```
+
+完整 VTP：
+
+```bash
+python -m scripts.inference_i2mv_sdxl_nile \
+  --image examples/chair.png \
+  --text "high quality, detailed object" \
+  --seed 42 \
+  --azimuth_deg 0 45 90 180 270 315 \
+  --num_inference_steps 50 \
+  --guidance_scale 3.0 \
+  --nile_mode nile_vtp \
+  --nile_callback nile_vtp \
+  --rho_geo 0.65 \
+  --rho_start 0.45 \
+  --active_ratio 0.6 \
+  --patch_size 8 \
+  --output outputs/chair_nile_vtp.png
+```
+
+---
+
+# 11. 必须跑的 baseline 矩阵
+
+第一轮不要太大，先做干净。
+
+| 组别              | `nile_mode`      | `nile_callback` | 目的                                 |
+| --------------- | ---------------- | --------------- | ---------------------------------- |
+| IID             | `iid`            | `none`          | 默认随机噪声                             |
+| Shared Seed     | `shared`         | `none`          | 简单全共享，测试过耦合                        |
+| Low-pass Shared | `lowpass_shared` | `none`          | 强相关噪声 baseline                     |
+| Flat Sobol      | `flat_sobol`     | `none`          | 普通 QMC baseline                    |
+| NILE-V          | `nile_v`         | `none`          | 只验证 view latent coupling           |
+| NILE-VT         | `nile_v`         | `nile_vt`       | 验证 view + timestep trajectory      |
+| NILE-VTP        | `nile_vtp`       | `nile_vtp`      | 验证 view + timestep + patch Z-index |
+
+第一轮核心超参数：
+
+[
+\rho_{\text{geo}} \in {0.0,\ 0.25,\ 0.5,\ 0.65,\ 0.8,\ 1.0}
+]
+
+[
+\rho_{\text{start}} \in {0.25,\ 0.45,\ 0.65}
+]
+
+[
+\alpha = \text{active_ratio} \in {0.4,\ 0.6,\ 0.8}
+]
+
+预期现象：
+
+| 设置                       | 预期                     |
+| ------------------------ | ---------------------- |
+| (\rho=0)                 | 接近 IID，视角漂移较多          |
+| (\rho=1)                 | 过度共享，纹理复制 / 镜像风险高      |
+| (\rho=0.5\sim0.75)       | 最可能获得一致性与细节的平衡         |
+| callback 太强              | 画面变糊，view diversity 下降 |
+| callback 只在前 60% step 开启 | 通常更稳                   |
+
+---
+
+# 12. 批量实验脚本
+
+`run_nile_grid.py` 可以这样设计：
+
+```python
+# scripts/run_nile_grid.py
+
+import os
+import subprocess
+from pathlib import Path
+
+
+IMAGES = [
+    "inputs/obj_001.png",
+    "inputs/obj_002.png",
+    "inputs/obj_003.png",
+]
+
+MODES = [
+    ("iid", "none"),
+    ("shared", "none"),
+    ("lowpass_shared", "none"),
+    ("flat_sobol", "none"),
+    ("nile_v", "none"),
+    ("nile_v", "nile_vt"),
+    ("nile_vtp", "nile_vtp"),
+]
+
+SEEDS = [0, 1, 2, 3, 4]
+RHOS = [0.0, 0.25, 0.5, 0.65, 0.8, 1.0]
+
+
+def main():
+    out_root = Path("outputs/nile_grid")
+    out_root.mkdir(parents=True, exist_ok=True)
+
+    for image in IMAGES:
+        obj_name = Path(image).stem
+
+        for mode, callback in MODES:
+            for seed in SEEDS:
+                for rho in RHOS:
+                    out = out_root / f"{obj_name}_{mode}_{callback}_seed{seed}_rho{rho}.png"
+
+                    cmd = [
+                        "python", "-m", "scripts.inference_i2mv_sdxl_nile",
+                        "--image", image,
+                        "--text", "high quality, detailed object",
+                        "--seed", str(seed),
+                        "--num_inference_steps", "50",
+                        "--guidance_scale", "3.0",
+                        "--azimuth_deg", "0", "45", "90", "180", "270", "315",
+                        "--nile_mode", mode,
+                        "--nile_callback", callback,
+                        "--rho_geo", str(rho),
+                        "--rho_start", "0.45",
+                        "--active_ratio", "0.6",
+                        "--output", str(out),
+                    ]
+
+                    print(" ".join(cmd))
+                    subprocess.run(cmd, check=True)
+
+
+if __name__ == "__main__":
+    main()
+```
+
+第一轮不需要上百 prompt。先用 20–50 个输入图像、5 个 seed、6 个视角，就能看出趋势。
+
+---
+
+# 13. 评测指标
+
+## 13.1 主指标：MEt3R
+
+MEt3R 很适合作为主指标，因为它专门衡量 generated multi-view images 的一致性，不需要 ground-truth 3D，也不需要相机姿态。它用 DUSt3R 得到 dense 3D point maps，再跨视角投影 DINO features 并比较 feature similarity。([GitHub][7])
+
+我们要计算两种：
+
+[
+\text{MEt3R}_{adjacent}
+]
+
+相邻视角一致性，比如 (0^\circ\leftrightarrow45^\circ)、(45^\circ\leftrightarrow90^\circ)。
+
+[
+\text{MEt3R}_{opposite}
+]
+
+大视角一致性，比如 (0^\circ\leftrightarrow180^\circ)、(90^\circ\leftrightarrow270^\circ)。
+
+NILE 最可能先提升 adjacent，再逐渐改善 opposite。相反，如果 opposite 提升但 adjacent 变差，可能是 metric 或过度平滑问题。
+
+---
+
+## 13.2 辅助指标
+
+建议加这些：
+
+```text
+1. CLIP image-text alignment
+2. DINO adjacent-view feature similarity
+3. LPIPS between reconstructed / warped adjacent views
+4. Seed-to-seed variance
+5. Over-coupling score
+6. Texture diversity score
+```
+
+其中 **over-coupling score** 很重要，因为 shared seed baseline 可能让 MEt3R 升高，但同时造成纹理复制。我们需要证明 NILE 不是“把所有视角变得更像”，而是“低频更一致，高频仍然保持合理差异”。
+
+一个简单 over-coupling diagnostic：
+
+[
+\text{OverCouple}
+=================
+
+\frac{
+\text{LPIPS}*{\text{high-freq}}(I_v, I*{v'})
+}{
+\text{DINOConsistency}(I_v, I_{v'})
+}
+]
+
+如果 DINO consistency 上升，但 high-frequency texture diversity 完全消失，说明过耦合。
+
+---
+
+# 14. 结果应该怎么看
+
+理想结果应该长这样：
+
+| 方法              | MEt3R ↑ | Adjacent consistency ↑ | Texture diversity | 失败风险              |
+| --------------- | ------: | ---------------------: | ----------------: | ----------------- |
+| IID             |       低 |                      低 |                 高 | view drift        |
+| Shared          |     中/高 |                      高 |                 低 | 纹理复制、镜像           |
+| Low-pass Shared |      中高 |                     中高 |                 中 | 简单强 baseline      |
+| Flat Sobol      |       中 |                      中 |                 中 | 无 element control |
+| NILE-V          |      中高 |                      高 |                中高 | 最小有效版本            |
+| NILE-VT         |       高 |                      高 |                 中 | 可能过平滑             |
+| NILE-VTP        |   最高或次高 |                      高 |                中高 | 最完整               |
+
+最关键的论文图不是只放最终图片，而是放一个 2D 图：
+
+```text
+x-axis: texture diversity / high-frequency preservation
+y-axis: multi-view consistency / MEt3R
+```
+
+理想情况是：
+
+```text
+IID: diversity 高但 consistency 低
+Shared: consistency 高但 diversity 低
+NILE: 同时靠近右上角
+```
+
+这张图能非常清楚地说明 NILE 的价值。
+
+---
+
+# 15. 失败模式和修复策略
+
+## 15.1 生成结果变糊
+
+原因：低频 coupling 太强或 callback 开启太晚。
+
+修复：
+
+```text
+rho_start 降到 0.25–0.35
+active_ratio 降到 0.4–0.5
+只做 initial NILE-V，不做 VT callback
+```
+
+## 15.2 纹理复制明显
+
+原因：(\rho_{\text{geo}}) 过大，或者 high-pass residual 不够独立。
+
+修复：
+
+```text
+rho_geo 降到 0.5
+blur_sigma 增大，让共享部分更低频
+高频部分使用 scrambled Sobol / IID independent child
+```
+
+## 15.3 一致性没提升
+
+原因可能有三个：
+
+```text
+1. MV-Adapter 自身已经很强，NILE 边际增益小。
+2. coupling 只作用在 initial latent，不够影响轨迹。
+3. metric 对输入类型不敏感。
+```
+
+修复：
+
+```text
+先测更难的 azimuth: 0 60 120 180 240 300
+加入 NILE-VT callback
+比较 seed-to-seed variance，而不只看 MEt3R
+增加 failure prompts / challenging objects
+```
+
+## 15.4 MEt3R 升高但图像质量下降
+
+说明 sampler 可能牺牲了 sharpness。需要报告：
+
+```text
+CLIP score
+aesthetic score
+image sharpness
+human preference
+```
+
+并把 NILE 的 claim 收束为：
+
+> reduce low-frequency view drift without significantly degrading perceptual quality.
+
+---
+
+# 16. 严格论文版的 ablation
+
+最终论文至少要有这些 ablation：
+
+| Ablation                               | 目的                                  |
+| -------------------------------------- | ----------------------------------- |
+| IID vs Shared                          | 证明不是简单共享 seed                       |
+| Shared vs Low-pass Shared              | 证明频率分解必要                            |
+| Low-pass Shared vs NILE-V              | 证明低差异 view 子序列有效                    |
+| NILE-V vs NILE-VT                      | 证明 denoising trajectory coupling 有效 |
+| NILE-VT vs NILE-VTP                    | 证明 patch Z-index locality 有效        |
+| Flat Sobol vs NILE-VTP                 | 证明不是普通 QMC                          |
+| NILE-VTP without marginal preservation | 证明分布保持重要                            |
+| (\rho) sweep                           | 找一致性 / 多样性 trade-off                |
+| active_ratio sweep                     | 找早期/后期 coupling 边界                  |
+
+---
+
+# 17. 最小闭环实验版本
+
+真正开工时，第一版只做这个：
+
+```text
+Host: MV-Adapter I2MV SDXL
+Views: 6 views, default azimuth
+Inputs: 20 images
+Seeds: 5
+Steps: 50
+Methods: IID, Shared, Low-pass Shared, Flat Sobol, NILE-V
+Metrics: MEt3R adjacent/opposite + visual grid
+```
+
+如果 NILE-V 比 Low-pass Shared 和 Flat Sobol 都有优势，再做：
+
+```text
+NILE-VT callback
+NILE-VTP Morton patch
+rho / active_ratio sweep
+```
+
+这样能避免一开始就陷入复杂 SZ 实现。
+
+---
+
+# 18. 最终完整实验定义
+
+论文里可以这样定义完整版本：
+
+[
+\boxed{
+\text{NILE-ViewTime-MVAdapter}
+==============================
+
+\text{NILE-V initial latent}
++
+\text{NILE-VT early denoising coupling}
++
+\text{NILE-VTP patch-Z-index modulation}
+}
+]
+
+对应实现：
+
+```text
+Initial latent:
+    shared low-frequency parent
+    view-specific high-frequency child
+    low-discrepancy / SZ-generated child noise
+
+Denoising loop:
+    early-step low-frequency view coupling
+    rho decays over reverse diffusion
+    preserve original latent marginal
+
+Patch space:
+    Morton / Z-order over latent patches
+    patch-wise coupling modulation
+    later replace Sobol prototype with SZ sequence backend
+```
+
+最稳的研究 claim 是：
+
+> 在冻结 MV-Adapter 的情况下，NILE-ViewTime 通过结构化 time-view-patch latent trajectory，降低多视角扩散中的低频几何漂移，同时避免 shared seed 带来的高频纹理复制。
+
+这个实验设计既能跑出工程结果，也能服务论文叙事。它把 MV-Adapter 作为强宿主模型，把 NILE 放在随机轨迹层，恰好可以证明我们之前说的核心观点：**NILE 不是 3D prior，而是 multi-view diffusion 的误差谱整形器。**
+
+[1]: https://huanngzh.github.io/MV-Adapter-Page/ "MV-Adapter: Multi-view Consistent Image Generation Made Easy"
+[2]: https://github.com/huanngzh/MV-Adapter "GitHub - huanngzh/MV-Adapter: [ICCV 2025] Official impl. of \"MV-Adapter: Multi-view Consistent Image Generation Made Easy\" · GitHub"
+[3]: https://raw.githubusercontent.com/huanngzh/MV-Adapter/main/mvadapter/pipelines/pipeline_mvadapter_i2mv_sdxl.py "raw.githubusercontent.com"
+[4]: https://arxiv.org/abs/2505.20434?utm_source=chatgpt.com "SZ Sequences: Binary-Based $(0, 2^q)$-Sequences"
+[5]: https://docs.pytorch.org/docs/stable/generated/torch.quasirandom.SobolEngine.html?utm_source=chatgpt.com "SobolEngine — PyTorch 2.12 documentation"
+[6]: https://research.nvidia.com/labs/rtr/publication/ahmed2026nile/?utm_source=chatgpt.com "NILE: Nested Interleaving of Low-Dimensional Elements"
+[7]: https://github.com/mohammadasim98/met3r?utm_source=chatgpt.com "MEt3R : Measuring Multi-View Consistency in Generated ..."

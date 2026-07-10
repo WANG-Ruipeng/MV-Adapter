@@ -16,6 +16,8 @@ timm
 kornia
 scikit-image
 sentencepiece
+jaxtyping
+typeguard>=2.13,<3
 git+https://github.com/NVlabs/nvdiffrast.git
 
 # new added for training
