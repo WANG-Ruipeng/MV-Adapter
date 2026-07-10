@@ -78,7 +78,7 @@ mvadapter_t2mv_sd21.safetensors
 3. 在 CPU runtime 下载/复用 adapter checkpoint；只下载时可在这里结束。
 4. 切换到 GPU runtime 并检查 GPU。
 5. 从 GitHub 克隆或更新远端临时代码。
-6. 安装 Colab 精简依赖。
+6. 安装 Colab 精简依赖；`nvdiffrast` 会按 NVIDIA 官方要求使用 `--no-build-isolation` 单独安装。
 7. 执行一次文生多视图推理并把结果写入 Drive。
 
 从 CPU runtime 切换到 GPU 后，内存状态会重置。请重新运行挂载 Drive 和路径配置两节，再从 GPU 检查继续；已写入 Drive 的 checkpoint 不会丢失。

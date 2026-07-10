@@ -18,5 +18,3 @@ timm
 kornia
 scikit-image
 sentencepiece
-ninja
-nvdiffrast @ git+https://github.com/NVlabs/nvdiffrast.git
