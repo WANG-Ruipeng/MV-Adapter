@@ -1,0 +1,41 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Editors and local secrets
+.vscode/*
+!.vscode/extensions.json
+.env
+.env.*
+!.env.example
+
+# Model weights and local Hugging Face caches
+checkpoints/
+models/
+hf-cache/
+*.ckpt
+*.pt
+*.pth
+*.safetensors
+
+# Generated data and outputs
+outputs/
+output/
+data/
+gradio_cached_examples/
+wandb/
+lightning_logs/
+
+# OS files
+.DS_Store
+Thumbs.db
+

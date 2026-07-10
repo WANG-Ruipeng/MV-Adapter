@@ -1,0 +1,22 @@
+# Inference-only dependencies for Google Colab.
+# PyTorch and torchvision are supplied by the selected Colab runtime.
+controlnet_aux
+diffusers
+transformers
+peft
+huggingface_hub
+accelerate
+numpy
+opencv-python-headless
+safetensors
+pillow
+omegaconf
+trimesh
+einops
+gradio
+timm
+kornia
+scikit-image
+sentencepiece
+ninja
+nvdiffrast @ git+https://github.com/NVlabs/nvdiffrast.git
