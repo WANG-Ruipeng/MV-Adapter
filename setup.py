@@ -5,15 +5,7 @@ setup(
     version="0.1.0",
     description="MV-Adapter: A Multi-View Adapter for 3D Generation",
     author="Zehuan Huang",
-    packages=[
-        "mvadapter",
-        "mvadapter.loaders",
-        "mvadapter.models",
-        "mvadapter.pipelines",
-        "mvadapter.schedulers",
-        "mvadapter.utils",
-        "mvadapter.utils.mesh_utils",
-    ],
+    packages=find_packages(include=["mvadapter", "mvadapter.*"]),
     install_requires=[
         "torch>=2.0.0",
         "torchvision",

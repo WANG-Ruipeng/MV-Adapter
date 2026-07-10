@@ -283,6 +283,54 @@ python -m scripts.inference_i2mv_sdxl \
 --seed 0 --output output.png --remove_bg
 ```
 
+**Experimental NILE-ViewTime sampler (SDXL):**
+
+This training-free experiment keeps the MV-Adapter weights frozen and changes
+only the initial latent structure and, optionally, the early denoising
+trajectory. The current implementation is a scrambled-Sobol prototype. It is
+not the strict hierarchical NILE/SZ backend; SZ remains an explicit placeholder.
+
+Run one NILE-VTP sample:
+
+    python -m scripts.inference_i2mv_sdxl_nile \
+      --image assets/demo/i2mv/A_juvenile_emperor_penguin_chick.png \
+      --text "A juvenile emperor penguin chick" \
+      --seed 42 --nile_mode nile_vtp --nile_callback nile_vtp \
+      --rho_geo 0.65 --rho_start 0.45 --active_ratio 0.6 \
+      --output outputs/nile_penguin.png --remove_bg
+
+The command writes a horizontal grid, the processed reference image, individual
+view PNGs, and a metadata JSON file. Run the reproducible ablation matrix with:
+
+    python -m scripts.run_nile_grid \
+      --input "inputs/*.png" \
+      --methods iid shared lowpass_shared flat_sobol nile_v nile_vt nile_vtp \
+      --seeds 0 1 2 3 4 --rhos 0 0.25 0.5 0.65 0.8 1 \
+      --rho-starts 0.25 0.45 0.65 --active-ratios 0.4 0.6 0.8 \
+      --resume
+
+Rho-independent baselines are deduplicated by default. Use
+--repeat-baseline-rhos only when identical baseline rows are intentionally
+required. In the prompt-defined low/high formula, rho_geo=0 for
+lowpass_shared/NILE is high-pass child noise rather than IID; keep the explicit
+iid method as the baseline.
+
+Evaluate adjacent and opposite view pairs with lightweight diagnostics:
+
+    python -m scripts.eval_multiview_consistency \
+      --manifest outputs/nile_grid/manifest.jsonl \
+      --output outputs/nile_grid/metrics.json
+
+MEt3R is optional because it has a separate CUDA/PyTorch3D/FeatUp stack:
+
+    pip install git+https://github.com/mohammadasim98/met3r
+    python -m scripts.eval_multiview_consistency \
+      --manifest outputs/nile_grid/manifest.jsonl --metrics met3r \
+      --output outputs/nile_grid/met3r.json
+
+For the default cosine distance, raw MEt3R is in [0, 2] and lower is better.
+The evaluator records the score direction in JSON and CSV outputs.
+
 **With SD2.1:** (lower demand for computing resources and higher inference speed)
 
 > In our tests, ddpm scheduler works better than other schedulers here.
