@@ -1,5 +1,6 @@
 """CPU-only regression tests for the NILE experiment workflow scripts."""
 
+import ast
 import io
 import json
 import tempfile
@@ -36,6 +37,30 @@ class TestNILEGridWorkflow(unittest.TestCase):
                 "--rhos",
                 "0.0",
                 "0.5",
+                "--experiment-id",
+                "workflow-unit-test",
+                "--code-revision",
+                "unit-test-revision",
+                "--base-model-revision",
+                "base-revision",
+                "--vae-model-revision",
+                "vae-revision",
+                "--unet-model",
+                "example/unet",
+                "--unet-model-revision",
+                "unet-revision",
+                "--lora-model",
+                "example/lora/weights.safetensors",
+                "--lora-model-revision",
+                "lora-revision",
+                "--adapter-revision",
+                "adapter-revision",
+                "--adapter-sha256",
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "--birefnet-model",
+                "example/birefnet",
+                "--birefnet-revision",
+                "birefnet-revision",
                 "--rho-start",
                 "0.2",
                 "0.4",
@@ -54,6 +79,8 @@ class TestNILEGridWorkflow(unittest.TestCase):
             self.assertEqual(return_code, 0)
             payload = json.loads(manifest_path.read_text(encoding="utf-8"))
             self.assertEqual(payload["schema_version"], 1)
+            self.assertEqual(payload["experiment_id"], "workflow-unit-test")
+            self.assertEqual(payload["code_revision"], "unit-test-revision")
             records = payload["runs"]
 
             by_method = {}
@@ -98,6 +125,21 @@ class TestNILEGridWorkflow(unittest.TestCase):
             required_fields = {
                 "schema_version",
                 "run_id",
+                "experiment_id",
+                "code_revision",
+                "base_model",
+                "base_model_revision",
+                "vae_model",
+                "vae_model_revision",
+                "unet_model",
+                "unet_model_revision",
+                "lora_model",
+                "lora_model_revision",
+                "adapter_path",
+                "adapter_revision",
+                "adapter_sha256",
+                "birefnet_model",
+                "birefnet_revision",
                 "status",
                 "input",
                 "method",
@@ -119,8 +161,101 @@ class TestNILEGridWorkflow(unittest.TestCase):
                 self.assertTrue(required_fields.issubset(record))
                 self.assertEqual(record["status"], "dry_run")
                 self.assertEqual(record["seed"], 7)
+                self.assertEqual(record["experiment_id"], "workflow-unit-test")
+                self.assertEqual(record["code_revision"], "unit-test-revision")
+                self.assertEqual(record["base_model_revision"], "base-revision")
+                self.assertEqual(record["vae_model_revision"], "vae-revision")
+                self.assertEqual(record["unet_model_revision"], "unet-revision")
+                self.assertEqual(record["lora_model_revision"], "lora-revision")
+                self.assertEqual(record["adapter_revision"], "adapter-revision")
+                self.assertEqual(record["adapter_sha256"], "a" * 64)
+                self.assertEqual(record["birefnet_model"], "example/birefnet")
+                self.assertEqual(record["birefnet_revision"], "birefnet-revision")
                 self.assertIsInstance(record["command"], list)
                 self.assertIn("--output", record["command"])
+                for flag, value in (
+                    ("--base_model_revision", "base-revision"),
+                    ("--vae_model_revision", "vae-revision"),
+                    ("--unet_model_revision", "unet-revision"),
+                    ("--lora_model_revision", "lora-revision"),
+                    ("--adapter_revision", "adapter-revision"),
+                    ("--birefnet_model", "example/birefnet"),
+                    ("--birefnet_revision", "birefnet-revision"),
+                ):
+                    index = record["command"].index(flag)
+                    self.assertEqual(record["command"][index + 1], value)
+
+    def test_run_id_changes_across_experiment_and_code_revision(self):
+        base = {
+            "experiment_id": "full-a",
+            "code_revision": "commit-a",
+            "method": "iid_default",
+            "seed": 0,
+        }
+        run_id = run_nile_grid._run_id(base)
+        self.assertNotEqual(
+            run_id,
+            run_nile_grid._run_id({**base, "experiment_id": "full-b"}),
+        )
+        self.assertNotEqual(
+            run_id,
+            run_nile_grid._run_id({**base, "code_revision": "commit-b"}),
+        )
+
+
+class TestDistributionPreservingNotebookWorkflow(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        path = (
+            Path(__file__).resolve().parents[1]
+            / "notebooks"
+            / "mvadapter_distribution_preserving_colab.ipynb"
+        )
+        cls.notebook = json.loads(path.read_text(encoding="utf-8"))
+        sources = []
+        for index, cell in enumerate(cls.notebook["cells"]):
+            source = cell.get("source", "")
+            if isinstance(source, list):
+                source = "".join(source)
+            sources.append(source)
+            if cell.get("cell_type") == "code":
+                ast.parse(source, filename="notebook-cell-{}".format(index))
+        cls.source = "\n".join(sources)
+
+    def test_notebook_is_clean_and_unexecuted(self):
+        for cell in self.notebook["cells"]:
+            if cell.get("cell_type") == "code":
+                self.assertIsNone(cell.get("execution_count"))
+                self.assertEqual(cell.get("outputs"), [])
+
+    def test_repository_check_rejects_untracked_experiment_code(self):
+        self.assertIn('"--untracked-files=all"', self.source)
+        self.assertNotIn('"--untracked-files=no"', self.source)
+        self.assertIn('"ls-files"', self.source)
+        self.assertIn('"--error-unmatch"', self.source)
+
+    def test_hugging_face_revisions_are_resolved_and_forwarded(self):
+        self.assertIn("from huggingface_hub import hf_hub_download, model_info", self.source)
+        self.assertIn("resolved = info.sha", self.source)
+        self.assertIn("PRELOAD_MODEL_SNAPSHOTS = True", self.source)
+        self.assertIn(
+            "model_snapshots.append((BIREFNET_MODEL, BIREFNET_REVISION))",
+            self.source,
+        )
+        for name in (
+            "BASE_MODEL_REVISION",
+            "VAE_MODEL_REVISION",
+            "ADAPTER_REVISION",
+            "BIREFNET_REVISION",
+        ):
+            self.assertIn("{} =".format(name), self.source)
+        for flag in (
+            "--base-model-revision",
+            "--vae-model-revision",
+            "--adapter-revision",
+            "--birefnet-revision",
+        ):
+            self.assertIn(flag, self.source)
 
 
 class TestMultiviewEvaluationWorkflow(unittest.TestCase):
@@ -188,7 +323,14 @@ class TestMultiviewEvaluationWorkflow(unittest.TestCase):
             payload = json.loads(output_path.read_text(encoding="utf-8"))
             self.assertEqual(payload["schema_version"], 1)
             self.assertIn("not geometry-aware substitutes for MEt3R", payload["metric_notice"])
+            self.assertIn("collapse detectors", payload["metric_notice"])
             self.assertEqual(payload["settings"]["metrics"], "lightweight")
+            self.assertEqual(
+                payload["settings"]["lightweight_role"], "collapse_detector_only"
+            )
+            self.assertEqual(
+                payload["settings"]["angle_bins_deg"], [45.0, 90.0, 135.0, 180.0]
+            )
             self.assertIsNone(payload["settings"]["met3r"])
 
             self.assertEqual(len(payload["samples"]), 1)
@@ -203,6 +345,15 @@ class TestMultiviewEvaluationWorkflow(unittest.TestCase):
             self.assertEqual(sample["rho_geo"], 0.65)
             self.assertEqual(sample["rho_start"], 0.4)
             self.assertEqual(sample["active_ratio"], 0.6)
+            self.assertEqual(sample["angle_all_pair_count"], 15)
+            self.assertEqual(sample["angle_45_pair_count"], 4)
+            self.assertEqual(sample["angle_90_pair_count"], 5)
+            self.assertEqual(sample["angle_135_pair_count"], 4)
+            self.assertEqual(sample["angle_180_pair_count"], 2)
+            self.assertIn(
+                sample["collapse_detector_label"],
+                {"no_collapse_signal", "view_collapse_alert"},
+            )
 
             pair_groups = [row["pair_group"] for row in payload["pairs"]]
             self.assertEqual(pair_groups.count("adjacent"), 6)
@@ -211,6 +362,24 @@ class TestMultiviewEvaluationWorkflow(unittest.TestCase):
                 all("lowfreq_l1_similarity" in row for row in payload["pairs"])
             )
             self.assertTrue(all("met3r_score" not in row for row in payload["pairs"]))
+            self.assertEqual(len(payload["angle_pairs"]), 15)
+            self.assertEqual(
+                {
+                    angle: sum(
+                        row["angle_bin_deg"] == angle
+                        for row in payload["angle_pairs"]
+                    )
+                    for angle in (45.0, 90.0, 135.0, 180.0)
+                },
+                {45.0: 4, 90.0: 5, 135.0: 4, 180.0: 2},
+            )
+            self.assertEqual(len(payload["angle_bin_summaries"]), 4)
+            self.assertTrue(
+                all(
+                    row["r_hf_status"] == "missing_iid_reference"
+                    for row in payload["angle_bin_summaries"]
+                )
+            )
 
     def test_met3r_numpy_preprocessing_shape_range_and_layout(self):
         black = np.zeros((5, 7, 3), dtype=np.float32)
@@ -226,6 +395,138 @@ class TestMultiviewEvaluationWorkflow(unittest.TestCase):
         self.assertEqual(float(batch.max()), 1.0)
         self.assertTrue(np.all(batch[0, 0] == -1.0))
         self.assertTrue(np.all(batch[0, 1] == 1.0))
+
+    def test_r_hf_uses_iid_default_per_angle_and_emits_guardrail_labels(self):
+        rows = [
+            {
+                "method": "iid_default",
+                "inference_method": "iid_default",
+                "angle_bin_deg": 45.0,
+                "highfreq_l1_distance": 0.2,
+            },
+            {
+                "method": "camera_rbf_corr",
+                "inference_method": "camera_rbf_corr",
+                "angle_bin_deg": 45.0,
+                "highfreq_l1_distance": 0.16,
+            },
+            {
+                "method": "nested_tree_ab",
+                "inference_method": "nested_tree_ab",
+                "angle_bin_deg": 45.0,
+                "highfreq_l1_distance": 0.08,
+            },
+            {
+                "method": "shared_full",
+                "inference_method": "shared_full",
+                "angle_bin_deg": 45.0,
+                "highfreq_l1_distance": 0.02,
+            },
+        ]
+        eval_multiview_consistency._annotate_relative_high_frequency(
+            rows,
+            iid_method="iid_default",
+            metric_name="highfreq_l1_distance",
+            match_fields=("angle_bin_deg",),
+        )
+
+        self.assertAlmostEqual(rows[0]["r_hf"], 1.0)
+        self.assertEqual(rows[0]["r_hf_status"], "healthy")
+        self.assertAlmostEqual(rows[1]["r_hf"], 0.8)
+        self.assertEqual(rows[1]["r_hf_status"], "healthy")
+        self.assertAlmostEqual(rows[2]["r_hf"], 0.4)
+        self.assertEqual(rows[2]["r_hf_status"], "overcoupling_alert")
+        self.assertAlmostEqual(rows[3]["r_hf"], 0.1)
+        self.assertEqual(rows[3]["r_hf_status"], "likely_view_collapse")
+
+    def test_r_hf_pairs_iid_reference_per_input_before_aggregation(self):
+        rows = [
+            {
+                "experiment_id": "exp-a",
+                "code_revision": "commit-a",
+                "input_image": "small-iid.png",
+                "seed": 0,
+                "method": "iid_default",
+                "angle_bin_deg": 45.0,
+                "highfreq_l1_distance": 0.2,
+            },
+            {
+                "experiment_id": "exp-a",
+                "code_revision": "commit-a",
+                "input_image": "small-iid.png",
+                "seed": 0,
+                "method": "camera_rbf_corr",
+                "angle_bin_deg": 45.0,
+                "highfreq_l1_distance": 0.16,
+            },
+            {
+                "experiment_id": "exp-a",
+                "code_revision": "commit-a",
+                "input_image": "large-iid.png",
+                "seed": 0,
+                "method": "iid_default",
+                "angle_bin_deg": 45.0,
+                "highfreq_l1_distance": 0.8,
+            },
+            {
+                "experiment_id": "exp-a",
+                "code_revision": "commit-a",
+                "input_image": "large-iid.png",
+                "seed": 0,
+                "method": "camera_rbf_corr",
+                "angle_bin_deg": 45.0,
+                "highfreq_l1_distance": 0.64,
+            },
+        ]
+        match_fields = (
+            "experiment_id",
+            "code_revision",
+            "input_image",
+            "seed",
+            "angle_bin_deg",
+        )
+        eval_multiview_consistency._annotate_relative_high_frequency(
+            rows,
+            iid_method="iid_default",
+            metric_name="highfreq_l1_distance",
+            match_fields=match_fields,
+        )
+
+        self.assertAlmostEqual(rows[1]["r_hf"], 0.8)
+        self.assertAlmostEqual(rows[3]["r_hf"], 0.8)
+        self.assertAlmostEqual(
+            rows[1]["r_hf_reference_highfreq_l1_distance"], 0.2
+        )
+        self.assertAlmostEqual(
+            rows[3]["r_hf_reference_highfreq_l1_distance"], 0.8
+        )
+
+    def test_camera_response_monotonic_requires_strict_complete_order(self):
+        bins = [45.0, 90.0, 135.0, 180.0]
+        passing = {
+            "angle_45_lowfreq_l1_similarity": 0.9,
+            "angle_90_lowfreq_l1_similarity": 0.8,
+            "angle_135_lowfreq_l1_similarity": 0.7,
+            "angle_180_lowfreq_l1_similarity": 0.6,
+        }
+        self.assertEqual(
+            eval_multiview_consistency._camera_response_monotonic(passing, bins),
+            "passed",
+        )
+
+        failing = dict(passing)
+        failing["angle_135_lowfreq_l1_similarity"] = 0.8
+        self.assertEqual(
+            eval_multiview_consistency._camera_response_monotonic(failing, bins),
+            "failed",
+        )
+
+        incomplete = dict(passing)
+        incomplete.pop("angle_180_lowfreq_l1_similarity")
+        self.assertEqual(
+            eval_multiview_consistency._camera_response_monotonic(incomplete, bins),
+            "not_available",
+        )
 
 
 if __name__ == "__main__":

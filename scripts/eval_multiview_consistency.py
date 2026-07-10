@@ -1,9 +1,9 @@
-"""Evaluate adjacent and opposite pairs in multiview image outputs.
+"""Evaluate camera response and collapse diagnostics in multiview outputs.
 
-The default ``lightweight`` metrics depend only on NumPy and Pillow.  They are
-image-space diagnostics, not a replacement for a geometry-aware metric: they are
-useful for quickly detecting low-frequency drift and high-frequency collapse while
-an experiment is running.  MEt3R is available as an explicit optional backend and
+The default ``lightweight`` metrics depend only on NumPy and Pillow. They are
+strictly collapse detectors and distribution guardrails, not multiview-consistency
+scores and not a replacement for a geometry-aware metric. MEt3R is available as
+an explicit optional backend and
 is imported only when requested.  The official default ``cosine`` MEt3R output is
 the distance ``1 - cosine`` in approximately ``[0, 2]``: ``met3r_score`` is lower
 when consistency is better.  This is the opposite of the ``MEt3R upward arrow``
@@ -58,6 +58,7 @@ from PIL import Image, ImageFilter
 
 
 DEFAULT_AZIMUTHS = [0.0, 45.0, 90.0, 180.0, 270.0, 315.0]
+DEFAULT_ANGLE_BINS = [45.0, 90.0, 135.0, 180.0]
 IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp", ".bmp", ".tif", ".tiff"}
 RESAMPLE_LANCZOS = getattr(Image, "Resampling", Image).LANCZOS
 MET3R_DIRECTIONS = {
@@ -68,6 +69,34 @@ MET3R_DIRECTIONS = {
     "psnr": "higher_is_better",
     "ssim": "higher_is_better",
 }
+REPORT_FIELDS = (
+    "experiment_id",
+    "code_revision",
+    "input_image",
+    "method",
+    "inference_method",
+    "seed",
+    "max_correlation",
+    "frequency_scale",
+    "camera_length_scale",
+    "nile_mode",
+    "nile_callback",
+    "rho_geo",
+    "rho_start",
+    "active_ratio",
+)
+AGGREGATE_GROUP_FIELDS = (
+    "experiment_id",
+    "code_revision",
+    "method",
+    "inference_method",
+    "max_correlation",
+    "frequency_scale",
+    "camera_length_scale",
+    "nile_mode",
+    "nile_callback",
+    "rho_geo",
+)
 
 
 @dataclass
@@ -219,6 +248,9 @@ def _normalize_metadata(metadata: Mapping[str, Any]) -> Dict[str, Any]:
     nile = metadata.get("nile")
     if not isinstance(nile, Mapping):
         nile = {}
+    distribution = metadata.get("distribution")
+    if not isinstance(distribution, Mapping):
+        distribution = {}
     aliases = {
         "nile_mode": ("nile_mode", "mode"),
         "nile_callback": ("nile_callback", "callback"),
@@ -237,6 +269,24 @@ def _normalize_metadata(metadata: Mapping[str, Any]) -> Dict[str, Any]:
             if candidate in nile:
                 normalized[destination] = nile[candidate]
                 break
+    distribution_aliases = {
+        "inference_method": ("inference_method", "method"),
+        "max_correlation": ("max_correlation",),
+        "frequency_scale": ("frequency_scale",),
+        "camera_length_scale": ("camera_length_scale",),
+    }
+    for destination, candidates in distribution_aliases.items():
+        if destination in normalized:
+            continue
+        for candidate in candidates:
+            if candidate in distribution:
+                normalized[destination] = distribution[candidate]
+                break
+    input_value = normalized.get("input")
+    if isinstance(input_value, Mapping):
+        input_value = input_value.get("image", input_value.get("path"))
+    if input_value is not None:
+        normalized["input_image"] = str(input_value)
     if "method" not in normalized and "nile_mode" in normalized:
         callback = normalized.get("nile_callback", "none")
         normalized["method"] = (
@@ -510,6 +560,30 @@ def _pair_groups(
     return {"adjacent": adjacent, "opposite": opposite}
 
 
+def _angle_bin_token(angle: float) -> str:
+    rounded = round(float(angle))
+    if math.isclose(float(angle), rounded, abs_tol=1e-9):
+        return str(int(rounded))
+    return format(float(angle), ".8g").replace("-", "m").replace(".", "p")
+
+
+def _angle_bin_pairs(
+    angles: Sequence[float],
+    angle_bins: Sequence[float],
+    tolerance: float,
+) -> Dict[Tuple[int, int], float]:
+    """Assign every matching unordered pair to its nearest real angle bin."""
+
+    assignments: Dict[Tuple[int, int], float] = {}
+    for first in range(len(angles)):
+        for second in range(first + 1, len(angles)):
+            distance = _angular_distance(angles[first], angles[second])
+            nearest = min(angle_bins, key=lambda value: abs(distance - value))
+            if abs(distance - nearest) <= tolerance:
+                assignments[(first, second)] = float(nearest)
+    return assignments
+
+
 def _blur(image: np.ndarray, radius: float) -> np.ndarray:
     image_u8 = np.clip(np.rint(image * 255.0), 0, 255).astype(np.uint8)
     filtered = Image.fromarray(image_u8).filter(ImageFilter.GaussianBlur(radius=radius))
@@ -730,29 +804,38 @@ def _mean_or_none(values: Iterable[Any]) -> Optional[float]:
     return float(np.mean(finite)) if finite else None
 
 
-def _summarize_pair_rows(pair_rows: Sequence[Mapping[str, Any]]) -> Dict[str, Any]:
-    summary: Dict[str, Any] = {}
-    metric_names = sorted(
+PAIR_NON_METRIC_FIELDS = {
+    "sample_id",
+    "source",
+    "pair_group",
+    "first_index",
+    "second_index",
+    "first_path",
+    "second_path",
+    "first_azimuth_deg",
+    "second_azimuth_deg",
+    "angular_distance_deg",
+    "angle_bin_deg",
+    *REPORT_FIELDS,
+}
+
+
+def _numeric_metric_names(rows: Sequence[Mapping[str, Any]]) -> List[str]:
+    return sorted(
         {
             key
-            for row in pair_rows
+            for row in rows
             for key, value in row.items()
-            if key
-            not in {
-                "sample_id",
-                "source",
-                "pair_group",
-                "first_index",
-                "second_index",
-                "first_path",
-                "second_path",
-                "first_azimuth_deg",
-                "second_azimuth_deg",
-                "angular_distance_deg",
-            }
+            if key not in PAIR_NON_METRIC_FIELDS
+            and not isinstance(value, bool)
             and isinstance(value, (int, float, np.number))
         }
     )
+
+
+def _summarize_pair_rows(pair_rows: Sequence[Mapping[str, Any]]) -> Dict[str, Any]:
+    summary: Dict[str, Any] = {}
+    metric_names = _numeric_metric_names(pair_rows)
     for group in ("adjacent", "opposite"):
         rows = [row for row in pair_rows if row.get("pair_group") == group]
         summary["{}_pair_count".format(group)] = len(rows)
@@ -763,8 +846,90 @@ def _summarize_pair_rows(pair_rows: Sequence[Mapping[str, Any]]) -> Dict[str, An
     return summary
 
 
+def _summarize_angle_rows(
+    angle_rows: Sequence[Mapping[str, Any]],
+    angle_bins: Sequence[float],
+) -> Dict[str, Any]:
+    """Summarize camera response at each requested real angular separation."""
+
+    summary: Dict[str, Any] = {"angle_all_pair_count": len(angle_rows)}
+    metric_names = _numeric_metric_names(angle_rows)
+    for metric_name in metric_names:
+        summary["angle_all_{}".format(metric_name)] = _mean_or_none(
+            row.get(metric_name) for row in angle_rows
+        )
+    for angle_bin in angle_bins:
+        token = _angle_bin_token(angle_bin)
+        rows = [
+            row
+            for row in angle_rows
+            if row.get("angle_bin_deg") is not None
+            and math.isclose(float(row["angle_bin_deg"]), angle_bin, abs_tol=1e-9)
+        ]
+        prefix = "angle_{}".format(token)
+        summary["{}_pair_count".format(prefix)] = len(rows)
+        for metric_name in metric_names:
+            summary["{}_{}".format(prefix, metric_name)] = _mean_or_none(
+                row.get(metric_name) for row in rows
+            )
+    summary["camera_response_monotonic"] = _camera_response_monotonic(
+        summary, angle_bins
+    )
+    return summary
+
+
+def _camera_response_monotonic(
+    summary: Mapping[str, Any],
+    angle_bins: Sequence[float],
+) -> str:
+    """Check the lightweight S(near) > ... > S(far) collapse diagnostic."""
+
+    values = []
+    for angle_bin in sorted(angle_bins):
+        key = "angle_{}_lowfreq_l1_similarity".format(
+            _angle_bin_token(angle_bin)
+        )
+        value = _mean_or_none([summary.get(key)])
+        if value is None:
+            return "not_available"
+        values.append(value)
+    if len(values) < 2:
+        return "not_available"
+    return (
+        "passed"
+        if all(first > second for first, second in zip(values, values[1:]))
+        else "failed"
+    )
+
+
+def _collapse_detector_label(
+    angle_rows: Sequence[Mapping[str, Any]],
+    angle_bins: Sequence[float],
+    threshold: float,
+) -> str:
+    """Flag near-identical responses at every covered angle; never claim geometry."""
+
+    similarities = []
+    for angle_bin in angle_bins:
+        rows = [
+            row
+            for row in angle_rows
+            if row.get("angle_bin_deg") is not None
+            and math.isclose(float(row["angle_bin_deg"]), angle_bin, abs_tol=1e-9)
+        ]
+        value = _mean_or_none(row.get("lowfreq_l1_similarity") for row in rows)
+        if value is None:
+            return "not_available" if not similarities else "incomplete_angle_coverage"
+        similarities.append(value)
+    return (
+        "view_collapse_alert"
+        if similarities and all(value >= threshold for value in similarities)
+        else "no_collapse_signal"
+    )
+
+
 def _aggregate_samples(samples: Sequence[Mapping[str, Any]]) -> List[Dict[str, Any]]:
-    group_keys = ["method", "nile_mode", "nile_callback", "rho_geo"]
+    group_keys = list(AGGREGATE_GROUP_FIELDS)
     groups: MutableMapping[Tuple[Any, ...], List[Mapping[str, Any]]] = {}
     for sample in samples:
         key = tuple(sample.get(name) for name in group_keys)
@@ -794,8 +959,179 @@ def _aggregate_samples(samples: Sequence[Mapping[str, Any]]) -> List[Dict[str, A
         )
         for name in metric_names:
             aggregate[name] = _mean_or_none(row.get(name) for row in rows)
+        r_hf = _mean_or_none(row.get("r_hf") for row in rows)
+        if r_hf is not None:
+            aggregate["r_hf"] = r_hf
+            aggregate["r_hf_status"] = _r_hf_status(r_hf)
+        elif any(row.get("r_hf_status") == "missing_iid_reference" for row in rows):
+            aggregate["r_hf_status"] = "missing_iid_reference"
+        elif any(row.get("r_hf_status") == "invalid_iid_reference" for row in rows):
+            aggregate["r_hf_status"] = "invalid_iid_reference"
+        else:
+            aggregate["r_hf_status"] = "not_available"
+        aggregate["r_hf_reference_method"] = next(
+            (
+                row.get("r_hf_reference_method")
+                for row in rows
+                if row.get("r_hf_reference_method") is not None
+            ),
+            None,
+        )
         aggregates.append(aggregate)
     return aggregates
+
+
+def _build_sample_angle_bin_summaries(
+    angle_rows: Sequence[Mapping[str, Any]],
+) -> List[Dict[str, Any]]:
+    group_keys = [
+        "sample_id",
+        "input_image",
+        "seed",
+        *AGGREGATE_GROUP_FIELDS,
+        "angle_bin_deg",
+    ]
+    groups: MutableMapping[Tuple[Any, ...], List[Mapping[str, Any]]] = {}
+    for row in angle_rows:
+        if row.get("angle_bin_deg") is None:
+            continue
+        key = tuple(row.get(name) for name in group_keys)
+        groups.setdefault(key, []).append(row)
+
+    summaries: List[Dict[str, Any]] = []
+    for key, rows in sorted(groups.items(), key=lambda item: repr(item[0])):
+        summary: Dict[str, Any] = dict(zip(group_keys, key))
+        summary["pair_count"] = len(rows)
+        for metric_name in _numeric_metric_names(rows):
+            summary[metric_name] = _mean_or_none(
+                row.get(metric_name) for row in rows
+            )
+        summaries.append(summary)
+    return summaries
+
+
+def _build_angle_bin_summaries(
+    sample_angle_rows: Sequence[Mapping[str, Any]],
+) -> List[Dict[str, Any]]:
+    """Aggregate per-sample angle summaries after paired IID normalization."""
+
+    group_keys = [*AGGREGATE_GROUP_FIELDS, "angle_bin_deg"]
+    groups: MutableMapping[Tuple[Any, ...], List[Mapping[str, Any]]] = {}
+    for row in sample_angle_rows:
+        key = tuple(row.get(name) for name in group_keys)
+        groups.setdefault(key, []).append(row)
+
+    summaries: List[Dict[str, Any]] = []
+    excluded = {
+        "sample_id",
+        "input_image",
+        "seed",
+        "pair_count",
+        *group_keys,
+    }
+    for key, rows in sorted(groups.items(), key=lambda item: repr(item[0])):
+        summary: Dict[str, Any] = dict(zip(group_keys, key))
+        summary["sample_count"] = len(rows)
+        summary["pair_count"] = sum(int(row.get("pair_count", 0)) for row in rows)
+        metric_names = sorted(
+            {
+                name
+                for row in rows
+                for name, value in row.items()
+                if name not in excluded
+                and not isinstance(value, bool)
+                and isinstance(value, (int, float, np.number))
+            }
+        )
+        for metric_name in metric_names:
+            summary[metric_name] = _mean_or_none(
+                row.get(metric_name) for row in rows
+            )
+        r_hf = _mean_or_none(row.get("r_hf") for row in rows)
+        if r_hf is not None:
+            summary["r_hf"] = r_hf
+            summary["r_hf_status"] = _r_hf_status(r_hf)
+        elif any(row.get("r_hf_status") == "missing_iid_reference" for row in rows):
+            summary["r_hf_status"] = "missing_iid_reference"
+        elif any(row.get("r_hf_status") == "invalid_iid_reference" for row in rows):
+            summary["r_hf_status"] = "invalid_iid_reference"
+        else:
+            summary["r_hf_status"] = "not_available"
+        summary["r_hf_reference_method"] = next(
+            (
+                row.get("r_hf_reference_method")
+                for row in rows
+                if row.get("r_hf_reference_method") is not None
+            ),
+            None,
+        )
+        summaries.append(summary)
+    return summaries
+
+
+def _effective_method(row: Mapping[str, Any]) -> str:
+    return str(row.get("inference_method") or row.get("method") or "")
+
+
+def _r_hf_status(value: Optional[float]) -> str:
+    if value is None or not math.isfinite(value):
+        return "not_available"
+    if value > 0.75:
+        return "healthy"
+    if value >= 0.5:
+        return "visual_check"
+    if value >= 0.2:
+        return "overcoupling_alert"
+    return "likely_view_collapse"
+
+
+def _annotate_relative_high_frequency(
+    rows: Sequence[MutableMapping[str, Any]],
+    *,
+    iid_method: str,
+    metric_name: str,
+    match_fields: Sequence[str] = (),
+) -> None:
+    """Add R_HF = method high-frequency distance / IID reference distance."""
+
+    if not any(_mean_or_none([row.get(metric_name)]) is not None for row in rows):
+        for row in rows:
+            row["r_hf"] = None
+            row["r_hf_status"] = "not_available"
+            row["r_hf_reference_method"] = iid_method
+            row["r_hf_reference_highfreq_l1_distance"] = None
+        return
+
+    references: MutableMapping[Tuple[Any, ...], List[float]] = {}
+    for row in rows:
+        if _effective_method(row) != iid_method:
+            continue
+        value = _mean_or_none([row.get(metric_name)])
+        if value is not None:
+            key = tuple(row.get(field) for field in match_fields)
+            references.setdefault(key, []).append(value)
+
+    reference_means = {
+        key: _mean_or_none(values) for key, values in references.items()
+    }
+    for row in rows:
+        key = tuple(row.get(field) for field in match_fields)
+        reference = reference_means.get(key)
+        numerator = _mean_or_none([row.get(metric_name)])
+        if reference is None:
+            row["r_hf"] = None
+            row["r_hf_status"] = "missing_iid_reference"
+        elif reference <= 1e-12:
+            row["r_hf"] = None
+            row["r_hf_status"] = "invalid_iid_reference"
+        elif numerator is None:
+            row["r_hf"] = None
+            row["r_hf_status"] = "not_available"
+        else:
+            row["r_hf"] = numerator / reference
+            row["r_hf_status"] = _r_hf_status(row["r_hf"])
+        row["r_hf_reference_method"] = iid_method
+        row["r_hf_reference_highfreq_l1_distance"] = reference
 
 
 def _csv_value(value: Any) -> Any:
@@ -821,7 +1157,9 @@ def _write_results(
     path: Path,
     sample_rows: Sequence[Mapping[str, Any]],
     pair_rows: Sequence[Mapping[str, Any]],
+    angle_pair_rows: Sequence[Mapping[str, Any]],
     aggregates: Sequence[Mapping[str, Any]],
+    angle_bin_summaries: Sequence[Mapping[str, Any]],
     settings: Mapping[str, Any],
 ) -> List[Path]:
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -831,8 +1169,9 @@ def _write_results(
             "schema_version": 1,
             "generated_at": _utc_now(),
             "metric_notice": (
-                "Lightweight metrics are unregistered image-space diagnostics; "
-                "they are not geometry-aware substitutes for MEt3R. "
+                "Lightweight pixel metrics are collapse detectors and distribution "
+                "guardrails only; they are not multiview-consistency scores and "
+                "not geometry-aware substitutes for MEt3R. "
                 + (
                     str(settings["met3r"]["interpretation"])
                     if settings.get("met3r")
@@ -842,7 +1181,9 @@ def _write_results(
             "settings": dict(settings),
             "samples": list(sample_rows),
             "pairs": list(pair_rows),
+            "angle_pairs": list(angle_pair_rows),
             "aggregates": list(aggregates),
+            "angle_bin_summaries": list(angle_bin_summaries),
         }
         with temporary.open("w", encoding="utf-8", newline="\n") as handle:
             json.dump(payload, handle, indent=2, ensure_ascii=False)
@@ -851,17 +1192,24 @@ def _write_results(
         return [path]
     if path.suffix.lower() == ".csv":
         pair_path = path.with_name(path.stem + "_pairs.csv")
+        angle_pair_path = path.with_name(path.stem + "_angle_pairs.csv")
         summary_path = path.with_name(path.stem + "_summary.csv")
+        angle_bin_path = path.with_name(path.stem + "_angle_bins.csv")
         _write_csv(path, sample_rows)
         _write_csv(pair_path, pair_rows)
+        _write_csv(angle_pair_path, angle_pair_rows)
         _write_csv(summary_path, aggregates)
-        return [path, pair_path, summary_path]
+        _write_csv(angle_bin_path, angle_bin_summaries)
+        return [path, pair_path, angle_pair_path, summary_path, angle_bin_path]
     raise ValueError("--output must end in .json or .csv.")
 
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Evaluate adjacent/opposite consistency of multiview outputs.",
+        description=(
+            "Evaluate angle-binned camera response, collapse guardrails, and "
+            "optional MEt3R on multiview outputs."
+        ),
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
         epilog=(
             "MEt3R install (optional): pip install "
@@ -898,6 +1246,33 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--blur-radius", type=float, default=4.0, help="Low/high-frequency split radius in evaluation pixels.")
     parser.add_argument("--opposite-tolerance", type=float, default=5.0, help="Allowed deviation from 180 degrees.")
+    parser.add_argument(
+        "--angle-bins",
+        type=float,
+        nargs="+",
+        default=DEFAULT_ANGLE_BINS,
+        help="Real angular separations used for camera-response summaries.",
+    )
+    parser.add_argument(
+        "--angle-bin-tolerance",
+        type=float,
+        default=5.0,
+        help="Maximum absolute angular error when assigning a pair to a bin.",
+    )
+    parser.add_argument(
+        "--iid-baseline-method",
+        default="iid_default",
+        help="Method used as the denominator of R_HF.",
+    )
+    parser.add_argument(
+        "--collapse-similarity-threshold",
+        type=float,
+        default=0.98,
+        help=(
+            "Lightweight alert threshold: all available angle-bin low-frequency "
+            "similarities at or above this value indicate possible view collapse."
+        ),
+    )
     parser.set_defaults(adjacent_wrap=True)
     parser.add_argument("--no-adjacent-wrap", dest="adjacent_wrap", action="store_false", help="Do not compare the last sorted azimuth with the first.")
     parser.add_argument("--metrics", choices=["lightweight", "met3r", "all"], default="lightweight")
@@ -939,6 +1314,20 @@ def _validate_args(parser: argparse.ArgumentParser, args: argparse.Namespace) ->
         parser.error("--blur-radius must be positive.")
     if not 0 <= args.opposite_tolerance <= 180:
         parser.error("--opposite-tolerance must lie in [0, 180].")
+    if not args.angle_bins:
+        parser.error("--angle-bins requires at least one value.")
+    if any(
+        not math.isfinite(value) or not 0 < value <= 180
+        for value in args.angle_bins
+    ):
+        parser.error("--angle-bins values must be finite and lie in (0, 180].")
+    args.angle_bins = sorted(set(float(value) for value in args.angle_bins))
+    if not math.isfinite(args.angle_bin_tolerance) or not 0 <= args.angle_bin_tolerance <= 180:
+        parser.error("--angle-bin-tolerance must lie in [0, 180].")
+    if not args.iid_baseline_method.strip():
+        parser.error("--iid-baseline-method cannot be empty.")
+    if not 0 <= args.collapse_similarity_threshold <= 1:
+        parser.error("--collapse-similarity-threshold must lie in [0, 1].")
     if args.met3r_batch_size <= 0:
         parser.error("--met3r-batch-size must be positive.")
     if args.output.suffix.lower() not in {".json", ".csv"}:
@@ -978,6 +1367,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
     sample_rows: List[Dict[str, Any]] = []
     all_pair_rows: List[Dict[str, Any]] = []
+    all_angle_pair_rows: List[Dict[str, Any]] = []
     failures = 0
     for index, sample in enumerate(samples, 1):
         print("[{}/{}] evaluating {}".format(index, len(samples), sample.sample_id), flush=True)
@@ -986,7 +1376,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             "source": str(sample.source),
             "status": "running",
         }
-        for key in ("method", "nile_mode", "nile_callback", "seed", "rho_geo", "rho_start", "active_ratio"):
+        for key in REPORT_FIELDS:
             if key in sample.metadata:
                 base_row[key] = sample.metadata[key]
         try:
@@ -997,39 +1387,69 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 image_size=0,
             )
             groups = _pair_groups(angles, args.adjacent_wrap, args.opposite_tolerance)
-            pair_rows: List[Dict[str, Any]] = []
-            pair_images: List[Tuple[np.ndarray, np.ndarray]] = []
-            for group_name, pairs in groups.items():
-                for first, second in pairs:
-                    row: Dict[str, Any] = {
-                        "sample_id": sample.sample_id,
-                        "source": str(sample.source),
-                        "pair_group": group_name,
-                        "first_index": first,
-                        "second_index": second,
-                        "first_path": labels[first],
-                        "second_path": labels[second],
-                        "first_azimuth_deg": angles[first],
-                        "second_azimuth_deg": angles[second],
-                        "angular_distance_deg": _angular_distance(angles[first], angles[second]),
-                    }
-                    if args.metrics in {"lightweight", "all"}:
-                        row.update(
-                            _lightweight_metrics(
-                                views[first],
-                                views[second],
-                                args.blur_radius,
-                                args.image_size,
-                            )
-                        )
-                    pair_rows.append(row)
-                    pair_images.append((views[first], views[second]))
+            angle_assignments = _angle_bin_pairs(
+                angles, args.angle_bins, args.angle_bin_tolerance
+            )
+            required_pairs = set(angle_assignments)
+            for pairs in groups.values():
+                required_pairs.update(pairs)
 
-            if met3r is not None and pair_images:
-                scores = met3r.evaluate(pair_images)
-                for row, score in zip(pair_rows, scores):
+            evaluated_rows: Dict[Tuple[int, int], Dict[str, Any]] = {}
+            evaluated_images: List[Tuple[np.ndarray, np.ndarray]] = []
+            evaluated_keys: List[Tuple[int, int]] = []
+            for first, second in sorted(required_pairs):
+                row: Dict[str, Any] = {
+                    "sample_id": sample.sample_id,
+                    "source": str(sample.source),
+                    "first_index": first,
+                    "second_index": second,
+                    "first_path": labels[first],
+                    "second_path": labels[second],
+                    "first_azimuth_deg": angles[first],
+                    "second_azimuth_deg": angles[second],
+                    "angular_distance_deg": _angular_distance(
+                        angles[first], angles[second]
+                    ),
+                    "angle_bin_deg": angle_assignments.get((first, second)),
+                }
+                for key in REPORT_FIELDS:
+                    if key in base_row:
+                        row[key] = base_row[key]
+                if args.metrics in {"lightweight", "all"}:
+                    row.update(
+                        _lightweight_metrics(
+                            views[first],
+                            views[second],
+                            args.blur_radius,
+                            args.image_size,
+                        )
+                    )
+                evaluated_rows[(first, second)] = row
+                evaluated_keys.append((first, second))
+                evaluated_images.append((views[first], views[second]))
+
+            if met3r is not None and evaluated_images:
+                scores = met3r.evaluate(evaluated_images)
+                for pair_key, score in zip(evaluated_keys, scores):
+                    row = evaluated_rows[pair_key]
                     row["met3r_score"] = score
                     row["met3r_score_direction"] = met3r.score_direction
+
+            pair_rows: List[Dict[str, Any]] = []
+            for group_name, pairs in groups.items():
+                for pair_key in pairs:
+                    row = dict(evaluated_rows[pair_key])
+                    row["pair_group"] = group_name
+                    pair_rows.append(row)
+            angle_rows: List[Dict[str, Any]] = []
+            for pair_key, angle_bin in sorted(
+                angle_assignments.items(), key=lambda item: (item[1], item[0])
+            ):
+                row = dict(evaluated_rows[pair_key])
+                row["pair_group"] = "angle_{}".format(
+                    _angle_bin_token(angle_bin)
+                )
+                angle_rows.append(row)
 
             base_row.update(
                 {
@@ -1037,12 +1457,27 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                     "num_views": len(views),
                     "azimuth_deg": angles,
                     **_summarize_pair_rows(pair_rows),
+                    **_summarize_angle_rows(angle_rows, args.angle_bins),
+                    "collapse_detector_label": _collapse_detector_label(
+                        angle_rows,
+                        args.angle_bins,
+                        args.collapse_similarity_threshold,
+                    ),
                 }
             )
             if met3r is not None:
                 base_row["met3r_score_direction"] = met3r.score_direction
             sample_rows.append(base_row)
             all_pair_rows.extend(pair_rows)
+            all_angle_pair_rows.extend(angle_rows)
+            if not angle_rows:
+                _warn(
+                    "sample {} has no pairs in angle bins {} +/- {} degrees".format(
+                        sample.sample_id,
+                        args.angle_bins,
+                        args.angle_bin_tolerance,
+                    )
+                )
             if not groups["opposite"]:
                 _warn(
                     "sample {} has no pairs within {} degrees of opposite".format(
@@ -1057,13 +1492,61 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             if args.fail_fast:
                 break
 
+    _annotate_relative_high_frequency(
+        sample_rows,
+        iid_method=args.iid_baseline_method,
+        metric_name="angle_all_highfreq_l1_distance",
+        match_fields=("experiment_id", "code_revision", "input_image", "seed"),
+    )
     aggregates = _aggregate_samples(sample_rows)
+    for aggregate in aggregates:
+        aggregate["camera_response_monotonic"] = _camera_response_monotonic(
+            aggregate, args.angle_bins
+        )
+    sample_angle_bin_summaries = _build_sample_angle_bin_summaries(
+        all_angle_pair_rows
+    )
+    _annotate_relative_high_frequency(
+        sample_angle_bin_summaries,
+        iid_method=args.iid_baseline_method,
+        metric_name="highfreq_l1_distance",
+        match_fields=(
+            "experiment_id",
+            "code_revision",
+            "input_image",
+            "seed",
+            "angle_bin_deg",
+        ),
+    )
+    angle_bin_summaries = _build_angle_bin_summaries(
+        sample_angle_bin_summaries
+    )
     settings = {
         "metrics": args.metrics,
+        "lightweight_role": "collapse_detector_only",
         "image_size": args.image_size,
         "blur_radius": args.blur_radius,
         "opposite_tolerance": args.opposite_tolerance,
         "adjacent_wrap": args.adjacent_wrap,
+        "angle_bins_deg": list(args.angle_bins),
+        "angle_bin_tolerance_deg": args.angle_bin_tolerance,
+        "collapse_similarity_threshold": args.collapse_similarity_threshold,
+        "camera_response_monotonic": (
+            "lightweight collapse diagnostic only: "
+            "S(45) > S(90) > S(135) > S(180) for the configured bins"
+        ),
+        "r_hf": {
+            "definition": (
+                "method highfreq_l1_distance / IID highfreq_l1_distance, "
+                "paired by experiment, code revision, input, seed, and angle bin "
+                "before aggregation"
+            ),
+            "iid_baseline_method": args.iid_baseline_method,
+            "healthy": "> 0.75",
+            "visual_check": "0.5 <= R_HF <= 0.75",
+            "overcoupling_alert": "0.2 <= R_HF < 0.5",
+            "likely_view_collapse": "< 0.2",
+        },
         "met3r": (
             {
                 "device": args.met3r_device,
@@ -1085,7 +1568,15 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     }
     output_path = args.output.expanduser().resolve()
     try:
-        written = _write_results(output_path, sample_rows, all_pair_rows, aggregates, settings)
+        written = _write_results(
+            output_path,
+            sample_rows,
+            all_pair_rows,
+            all_angle_pair_rows,
+            aggregates,
+            angle_bin_summaries,
+            settings,
+        )
     except (OSError, ValueError) as error:
         parser.error("Could not write results: {}".format(error))
     print("Wrote: " + ", ".join(str(path) for path in written))

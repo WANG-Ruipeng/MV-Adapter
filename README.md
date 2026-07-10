@@ -283,53 +283,74 @@ python -m scripts.inference_i2mv_sdxl \
 --seed 0 --output output.png --remove_bg
 ```
 
-**Experimental NILE-ViewTime sampler (SDXL):**
+**Distribution-preserving view-noise experiments (SDXL):**
 
-This training-free experiment keeps the MV-Adapter weights frozen and changes
-only the initial latent structure and, optionally, the early denoising
-trajectory. The current implementation is a scrambled-Sobol prototype. It is
-not the strict hierarchical NILE/SZ backend; SZ remains an explicit placeholder.
+The original one-dimensional Sobol, low-pass, and latent-callback experiment
+produced distribution-out-of-domain stripe failures. Its executed Colab output
+is intentionally frozen in
+[mvadapter_nile_experiments_colab.ipynb](notebooks/mvadapter_nile_experiments_colab.ipynb)
+and documented in [NILE_V0_FAILURE_ANALYSIS.md](docs/NILE_V0_FAILURE_ANALYSIS.md).
+Treat it only as a failure-analysis artifact.
 
-Run one NILE-VTP sample:
+The formal matrix disables Sobol and denoising callbacks. It uses exactly five
+user-provided asymmetric inputs, seeds 0/1/2, and strengths
+0.15/0.30/0.45/0.60, and compares
+iid_default, iid_external, shared_full, spectral_global_corr, camera_rbf_corr,
+nested_tree_a, and nested_tree_ab. Before loading SDXL, every sampler must pass
+the white-Gaussian, spatial autocorrelation, radial-PSD, and target-covariance
+gate:
 
-    python -m scripts.inference_i2mv_sdxl_nile \
-      --image assets/demo/i2mv/A_juvenile_emperor_penguin_chick.png \
-      --text "A juvenile emperor penguin chick" \
-      --seed 42 --nile_mode nile_vtp --nile_callback nile_vtp \
-      --rho_geo 0.65 --rho_start 0.45 --active_ratio 0.6 \
-      --output outputs/nile_penguin.png --remove_bg
+    python -m scripts.diagnose_nile_latents --methods iid_default iid_external shared_full spectral_global_corr camera_rbf_corr nested_tree_a nested_tree_ab --seeds 0 1 2 --strengths 0.15 0.30 0.45 0.60 --output outputs/nile_preflight.json
 
-The command writes a horizontal grid, the processed reference image, individual
-view PNGs, and a metadata JSON file. Run the reproducible ablation matrix with:
+Run the distribution-preserving grid after the gate succeeds. Formal runs should
+provide an explicit experiment ID and exact code revision (normally a 40-character
+commit). Both values,
+all model identifiers/revisions, and the complete generation configuration are
+stored in each manifest record and contribute to every run ID:
 
-    python -m scripts.run_nile_grid \
-      --input "inputs/*.png" \
-      --methods iid shared lowpass_shared flat_sobol nile_v nile_vt nile_vtp \
-      --seeds 0 1 2 3 4 --rhos 0 0.25 0.5 0.65 0.8 1 \
-      --rho-starts 0.25 0.45 0.65 --active-ratios 0.4 0.6 0.8 \
-      --resume
+    python -m scripts.run_nile_grid --experiment-id full-<commit>-<config-hash> --code-revision <40-char-commit> --input "inputs/*.png" --methods iid_default iid_external shared_full spectral_global_corr camera_rbf_corr nested_tree_a nested_tree_ab --seeds 0 1 2 --strengths 0.15 0.30 0.45 0.60 --frequency-scale 0.12 --camera-length-scale 0.8 --base-model stabilityai/stable-diffusion-xl-base-1.0 --base-model-revision <resolved-base-commit> --vae-model madebyollin/sdxl-vae-fp16-fix --vae-model-revision <resolved-vae-commit> --adapter-revision <resolved-adapter-commit> --adapter-sha256 <resolved-weight-sha256> --birefnet-revision <resolved-birefnet-commit> --output-root outputs/<experiment-id>/runs --manifest outputs/<experiment-id>/manifest.json --resume
 
-Rho-independent baselines are deduplicated by default. Use
---repeat-baseline-rhos only when identical baseline rows are intentionally
-required. In the prompt-defined low/high formula, rho_geo=0 for
-lowpass_shared/NILE is high-pass child noise rather than IID; keep the explicit
-iid method as the baseline.
+The clean, unexecuted Colab workflow is
+[mvadapter_distribution_preserving_colab.ipynb](notebooks/mvadapter_distribution_preserving_colab.ipynb).
+It keeps checkpoints and experiment outputs on Drive, blocks inference when the
+preflight report fails, and derives a dedicated experiment root from the code
+commit plus a hash of the complete configuration (including input file hashes,
+model revisions, and the resolved adapter weight SHA-256). Its default
+`QUICK_SMOKE` profile is only an 11-job
+pipeline smoke test and is not a formal experiment. `FULL` refuses the demo
+penguin, requires at least five user inputs, selects exactly five, and plans 285
+jobs. QUICK_SMOKE and FULL can never share a manifest or resume state.
+Before hashing that configuration, the notebook resolves every requested
+Hugging Face branch (including BiRefNet when background removal is enabled) to
+an immutable commit. It also rejects tracked or untracked files in the Colab
+checkout. Initial latents, reference-VAE sampling, and stochastic scheduler
+steps use independent random generators so method-specific latent construction
+cannot shift the scheduler-noise stream.
 
-Evaluate adjacent and opposite view pairs with lightweight diagnostics:
+When `--code-revision` is omitted for an ad-hoc local run, the grid runner
+detects git HEAD and adds a tracked/untracked-worktree dirty fingerprint. It also refuses
+to resume from a manifest containing another experiment ID or code revision.
 
-    python -m scripts.eval_multiview_consistency \
-      --manifest outputs/nile_grid/manifest.jsonl \
-      --output outputs/nile_grid/metrics.json
+Lightweight pixel metrics are collapse detectors and guardrails only; they are
+not geometry-aware consistency scores. The evaluator keeps the legacy
+adjacent/opposite summaries, adds real 45/90/135/180-degree bins, checks the
+diagnostic ordering S45 > S90 > S135 > S180, and reports high-frequency
+retention relative to the matched iid_default sample. Point the evaluator at
+the manifest inside one isolated experiment root only:
 
-MEt3R is optional because it has a separate CUDA/PyTorch3D/FeatUp stack:
+    python -m scripts.eval_multiview_consistency --manifest outputs/<experiment-id>/manifest.json --metrics lightweight --angle-bins 45 90 135 180 --iid-baseline-method iid_default --output outputs/<experiment-id>/collapse_diagnostics.json
+
+R_HF above 0.75 is healthy; 0.5-0.75 requires visual inspection; 0.2-0.5 is an
+over-coupling alert; below 0.2 is a likely view-collapse alert. R_HF is not a
+paper metric.
+
+MEt3R remains optional because it has a separate CUDA/PyTorch3D/FeatUp stack:
 
     pip install git+https://github.com/mohammadasim98/met3r
-    python -m scripts.eval_multiview_consistency \
-      --manifest outputs/nile_grid/manifest.jsonl --metrics met3r \
-      --output outputs/nile_grid/met3r.json
+    python -m scripts.eval_multiview_consistency --manifest outputs/<experiment-id>/manifest.json --metrics all --angle-bins 45 90 135 180 --iid-baseline-method iid_default --output outputs/<experiment-id>/met3r.json
 
-For the default cosine distance, raw MEt3R is in [0, 2] and lower is better.
-The evaluator records the score direction in JSON and CSV outputs.
+For the default cosine distance, raw MEt3R is approximately in [0, 2] and lower
+is better. JSON and CSV outputs preserve this score direction explicitly.
 
 **With SD2.1:** (lower demand for computing resources and higher inference speed)
 

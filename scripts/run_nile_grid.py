@@ -7,12 +7,11 @@ to resume from the manifest.
 
 Examples
 --------
-Run the minimum ablation on every PNG in ``inputs``::
+Run the distribution-preserving ablation on every PNG in ``inputs``::
 
     python -m scripts.run_nile_grid \
         --input "inputs/*.png" \
-        --methods iid shared lowpass_shared flat_sobol nile_v \
-        --seeds 0 1 2 3 4 --rhos 0.0 0.25 0.5 0.65 0.8 1.0
+        --seeds 0 1 2 --strengths 0.15 0.30 0.45 0.60
 
 Preview commands without launching inference::
 
@@ -30,9 +29,11 @@ import csv
 import glob
 import hashlib
 import json
+import math
 import os
 import re
 import shlex
+import stat
 import subprocess
 import sys
 import time
@@ -42,16 +43,30 @@ from typing import Any, Dict, Iterable, List, Mapping, MutableMapping, Optional,
 
 
 DEFAULT_AZIMUTHS = [0, 45, 90, 180, 270, 315]
-DEFAULT_METHODS = [
-    "iid",
-    "shared",
-    "lowpass_shared",
-    "flat_sobol",
-    "nile_v",
-    "nile_vt",
-    "nile_vtp",
+FORMAL_METHODS = [
+    "iid_default",
+    "iid_external",
+    "shared_full",
+    "spectral_global_corr",
+    "camera_rbf_corr",
+    "nested_tree_a",
+    "nested_tree_ab",
 ]
+DEFAULT_METHODS = [
+    *FORMAL_METHODS,
+]
+DEFAULT_STRENGTHS = [0.15, 0.30, 0.45, 0.60]
 METHOD_ALIASES: Mapping[str, Tuple[str, str]] = {
+    # Formal distribution-preserving matrix.
+    "iid_default": ("iid_default", "none"),
+    "iid_external": ("iid_external", "none"),
+    "shared_full": ("shared_full", "none"),
+    "spectral_global_corr": ("spectral_global_corr", "none"),
+    "camera_rbf_corr": ("camera_rbf_corr", "none"),
+    "nested_tree_a": ("nested_tree_a", "none"),
+    "nested_tree_ab": ("nested_tree_ab", "none"),
+    # Legacy failure-analysis aliases. They remain runnable but are excluded
+    # from DEFAULT_METHODS and must never be presented as formal NILE results.
     "iid": ("iid", "none"),
     "shared": ("shared", "none"),
     "lowpass_shared": ("lowpass_shared", "none"),
@@ -165,7 +180,7 @@ def _parse_method(specification: str) -> Tuple[str, str, str]:
     else:
         mode, callback = value, "none"
 
-    valid_modes = {"iid", "shared", "lowpass_shared", "flat_sobol", "nile_v", "nile_vtp"}
+    valid_modes = {mode for mode, _ in METHOD_ALIASES.values()}
     valid_callbacks = {"none", "nile_vt", "nile_vtp"}
     if mode not in valid_modes:
         raise ValueError(
@@ -181,6 +196,8 @@ def _parse_method(specification: str) -> Tuple[str, str, str]:
         )
     if callback == "nile_vtp" and mode != "nile_vtp":
         raise ValueError("The nile_vtp callback requires the nile_vtp sampler mode.")
+    if mode in FORMAL_METHODS and callback != "none":
+        raise ValueError("Formal distribution-preserving methods do not allow callbacks.")
     label = _slug(label or (mode if callback == "none" else "{}_{}".format(mode, callback)))
     return label, mode, callback
 
@@ -191,6 +208,92 @@ def _canonical_json(value: Mapping[str, Any]) -> str:
 
 def _run_id(configuration: Mapping[str, Any]) -> str:
     return hashlib.sha256(_canonical_json(configuration).encode("utf-8")).hexdigest()[:20]
+
+
+def _detect_code_revision(repo_root: Path) -> str:
+    """Return a resume-safe revision including tracked and untracked sources."""
+
+    try:
+        revision = subprocess.check_output(
+            ["git", "-C", str(repo_root), "rev-parse", "HEAD"],
+            text=True,
+            stderr=subprocess.DEVNULL,
+            timeout=5,
+        ).strip()
+        status = subprocess.check_output(
+            [
+                "git",
+                "-C",
+                str(repo_root),
+                "status",
+                "--porcelain=v1",
+                "-z",
+                "--untracked-files=all",
+            ],
+            stderr=subprocess.DEVNULL,
+            timeout=5,
+        )
+        tracked_diff = subprocess.check_output(
+            ["git", "-C", str(repo_root), "diff", "HEAD", "--binary"],
+            stderr=subprocess.DEVNULL,
+            timeout=5,
+        )
+    except (OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired):
+        return "unknown"
+
+    if status:
+        digest = hashlib.sha256()
+        digest.update(tracked_diff)
+        untracked = sorted(
+            entry[3:]
+            for entry in status.split(b"\0")
+            if entry.startswith(b"?? ") and entry[3:]
+        )
+        for relative_bytes in untracked:
+            relative = Path(os.fsdecode(relative_bytes))
+            candidate = repo_root / relative
+            digest.update(b"\0untracked\0")
+            digest.update(relative_bytes)
+            digest.update(b"\0")
+            try:
+                candidate.relative_to(repo_root)
+            except ValueError:
+                raise ValueError(
+                    "git reported an untracked path outside the repository: {}".format(
+                        relative
+                    )
+                )
+            try:
+                metadata = candidate.lstat()
+            except OSError as error:
+                raise ValueError(
+                    "could not fingerprint untracked path {}: {}".format(
+                        relative, error
+                    )
+                )
+            digest.update(str(metadata.st_mode).encode("ascii"))
+            if stat.S_ISLNK(metadata.st_mode):
+                target = os.readlink(candidate)
+                digest.update(b"\0symlink\0")
+                digest.update(os.fsencode(target))
+                raise ValueError(
+                    "automatic code revision refuses untracked symlink {}; "
+                    "commit/remove it or pass --code-revision explicitly".format(
+                        relative
+                    )
+                )
+            if not stat.S_ISREG(metadata.st_mode):
+                raise ValueError(
+                    "automatic code revision refuses non-regular untracked path {}; "
+                    "commit/remove it or pass --code-revision explicitly".format(
+                        relative
+                    )
+                )
+            with candidate.open("rb") as handle:
+                for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                    digest.update(chunk)
+        revision = "{}+dirty.{}".format(revision, digest.hexdigest()[:12])
+    return revision or "unknown"
 
 
 def _read_manifest(path: Path) -> List[Dict[str, Any]]:
@@ -239,6 +342,20 @@ def _write_manifest(path: Path, records: Sequence[Mapping[str, Any]]) -> None:
             "generated_at": _utc_now(),
             "runs": list(records),
         }
+        experiment_ids = _unique(
+            str(record["experiment_id"])
+            for record in records
+            if record.get("experiment_id")
+        )
+        code_revisions = _unique(
+            str(record["code_revision"])
+            for record in records
+            if record.get("code_revision")
+        )
+        if len(experiment_ids) == 1:
+            payload["experiment_id"] = experiment_ids[0]
+        if len(code_revisions) == 1:
+            payload["code_revision"] = code_revisions[0]
         with temporary.open("w", encoding="utf-8", newline="\n") as handle:
             json.dump(payload, handle, indent=2, ensure_ascii=False)
             handle.write("\n")
@@ -249,12 +366,18 @@ def _write_manifest(path: Path, records: Sequence[Mapping[str, Any]]) -> None:
     elif suffix == ".csv":
         preferred = [
             "run_id",
+            "experiment_id",
+            "code_revision",
             "status",
             "input",
             "method",
+            "inference_method",
             "nile_mode",
             "nile_callback",
             "seed",
+            "max_correlation",
+            "frequency_scale",
+            "camera_length_scale",
             "rho_geo",
             "output",
             "metadata_path",
@@ -316,17 +439,24 @@ def build_parser() -> argparse.ArgumentParser:
         default=DEFAULT_METHODS,
         metavar="METHOD",
         help=(
-            "Aliases or custom label=mode:callback specs. Built-ins: "
-            + ", ".join(DEFAULT_METHODS)
+            "Formal aliases or legacy label=mode:callback specs. Formal defaults: "
+            + ", ".join(FORMAL_METHODS)
         ),
     )
-    parser.add_argument("--seeds", type=int, nargs="+", default=[0, 1, 2, 3, 4])
+    parser.add_argument("--seeds", type=int, nargs="+", default=[0, 1, 2])
+    parser.add_argument(
+        "--strengths",
+        type=float,
+        nargs="+",
+        default=None,
+        help="max_correlation sweep for correlated formal methods.",
+    )
     parser.add_argument(
         "--rhos",
         type=float,
         nargs="+",
-        default=[0.0, 0.25, 0.5, 0.65, 0.8, 1.0],
-        help="rho_geo sweep values.",
+        default=None,
+        help="Legacy alias for --strengths/rho_geo sweeps.",
     )
     parser.add_argument(
         "--baseline-rho-once",
@@ -335,16 +465,17 @@ def build_parser() -> argparse.ArgumentParser:
         help=argparse.SUPPRESS,
     )
     parser.add_argument(
+        "--repeat-baseline-strengths",
         "--repeat-baseline-rhos",
         dest="repeat_baseline_rhos",
         action="store_true",
-        help="Intentionally repeat rho-independent baselines for every rho.",
+        help="Intentionally repeat strength-independent baselines at every strength.",
     )
     parser.set_defaults(repeat_baseline_rhos=False)
     parser.add_argument("--text", default="high quality, detailed object")
     parser.add_argument("--negative-prompt", default=None)
     parser.add_argument("--azimuth-deg", type=int, nargs="+", default=DEFAULT_AZIMUTHS)
-    parser.add_argument("--num-inference-steps", type=int, default=50)
+    parser.add_argument("--num-inference-steps", type=int, default=30)
     parser.add_argument("--guidance-scale", type=float, default=3.0)
     parser.add_argument("--reference-conditioning-scale", type=float, default=None)
     parser.add_argument("--lora-scale", type=float, default=None)
@@ -372,12 +503,62 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--blur-kernel", type=int, default=11)
     parser.add_argument("--blur-sigma", type=float, default=2.5)
     parser.add_argument("--patch-size", type=int, default=8)
+    parser.add_argument("--frequency-scale", type=float, default=0.12)
+    parser.add_argument("--camera-length-scale", type=float, default=0.8)
 
-    parser.add_argument("--base-model", default=None, help="Override inference-script default.")
-    parser.add_argument("--vae-model", default=None, help="Override inference-script default.")
+    parser.add_argument(
+        "--experiment-id",
+        default=None,
+        help=(
+            "Experiment namespace stored in every record and run id. An ad-hoc "
+            "namespace derived from the code revision is used when omitted."
+        ),
+    )
+    parser.add_argument(
+        "--code-revision",
+        default=None,
+        help=(
+            "Exact source revision stored in every record and run id. Defaults to "
+            "git HEAD plus a tracked/untracked worktree fingerprint."
+        ),
+    )
+    parser.add_argument(
+        "--base-model",
+        default="stabilityai/stable-diffusion-xl-base-1.0",
+        help="Base-model identifier passed to inference and recorded in the manifest.",
+    )
+    parser.add_argument(
+        "--base-model-revision",
+        default=None,
+        help="Requested base-model revision recorded for experiment provenance.",
+    )
+    parser.add_argument(
+        "--vae-model",
+        default="madebyollin/sdxl-vae-fp16-fix",
+        help="VAE identifier passed to inference and recorded in the manifest.",
+    )
+    parser.add_argument(
+        "--vae-model-revision",
+        default=None,
+        help="Requested VAE revision recorded for experiment provenance.",
+    )
     parser.add_argument("--unet-model", default=None)
+    parser.add_argument("--unet-model-revision", default=None)
     parser.add_argument("--lora-model", default=None)
-    parser.add_argument("--adapter-path", default=None)
+    parser.add_argument("--lora-model-revision", default=None)
+    parser.add_argument("--adapter-path", default="huanngzh/mv-adapter")
+    parser.add_argument(
+        "--adapter-revision",
+        default=None,
+        help="Requested adapter repository/checkpoint revision recorded in the manifest.",
+    )
+    parser.add_argument(
+        "--adapter-sha256",
+        default=None,
+        help="SHA-256 of the resolved adapter weight recorded in the run configuration.",
+    )
+    parser.add_argument("--birefnet-model", default="ZhengPeng7/BiRefNet")
+    parser.add_argument("--birefnet-revision", default=None)
     parser.add_argument("--scheduler", default=None)
     parser.add_argument("--device", default=None)
     parser.add_argument(
@@ -417,14 +598,33 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def _validate_args(args: argparse.Namespace) -> None:
+    if not str(args.experiment_id).strip():
+        raise ValueError("--experiment-id must not be empty.")
+    if not str(args.code_revision).strip():
+        raise ValueError("--code-revision must not be empty.")
+    if args.adapter_sha256 is not None:
+        args.adapter_sha256 = str(args.adapter_sha256).strip().lower()
+        if not re.fullmatch(r"[0-9a-f]{64}", args.adapter_sha256):
+            raise ValueError("--adapter-sha256 must be exactly 64 hexadecimal characters.")
     if not args.seeds:
         raise ValueError("At least one seed is required.")
-    if not args.rhos:
-        raise ValueError("At least one rho value is required.")
-    for name in ("rhos",):
-        for value in getattr(args, name):
-            if not 0.0 <= value <= 1.0:
-                raise ValueError("{} values must lie in [0, 1], got {}.".format(name, value))
+    if args.strengths is not None and args.rhos is not None:
+        raise ValueError("Use either --strengths or legacy --rhos, not both.")
+    using_legacy_rhos = args.strengths is None and args.rhos is not None
+    strengths = args.strengths if args.strengths is not None else args.rhos
+    args.strengths = list(DEFAULT_STRENGTHS if strengths is None else strengths)
+    # Keep this attribute populated for callers that consumed the legacy parser.
+    args.rhos = args.strengths
+    if not args.strengths:
+        raise ValueError("At least one correlation strength is required.")
+    for value in args.strengths:
+        valid = 0.0 <= value <= 1.0 if using_legacy_rhos else 0.0 <= value < 1.0
+        if not valid:
+            raise ValueError(
+                "correlation values are outside the allowed interval, got {}.".format(
+                    value
+                )
+            )
     if not 0.0 <= args.rho_end <= 1.0:
         raise ValueError("--rho-end must lie in [0, 1].")
     for value in args.rho_starts:
@@ -439,6 +639,10 @@ def _validate_args(args: argparse.Namespace) -> None:
         raise ValueError("--blur-sigma must be positive.")
     if args.patch_size <= 0:
         raise ValueError("--patch-size must be positive.")
+    if not math.isfinite(args.frequency_scale) or args.frequency_scale <= 0:
+        raise ValueError("--frequency-scale must be positive.")
+    if not math.isfinite(args.camera_length_scale) or args.camera_length_scale <= 0:
+        raise ValueError("--camera-length-scale must be positive.")
     if not args.azimuth_deg:
         raise ValueError("At least one azimuth is required.")
     if args.timeout is not None and args.timeout <= 0:
@@ -450,18 +654,25 @@ def _configuration(
     image: Path,
     method: Tuple[str, str, str],
     seed: int,
-    rho: float,
+    strength: float,
     rho_start: float,
     active_ratio: float,
 ) -> Dict[str, Any]:
     label, mode, callback = method
     return {
+        "experiment_id": args.experiment_id,
+        "code_revision": args.code_revision,
         "input": str(image),
         "method": label,
+        "inference_method": mode,
+        # Retained for consumers of the v1 manifest schema.
         "nile_mode": mode,
         "nile_callback": callback,
         "seed": seed,
-        "rho_geo": rho,
+        "max_correlation": strength,
+        "frequency_scale": args.frequency_scale,
+        "camera_length_scale": args.camera_length_scale,
+        "rho_geo": strength,
         "rho_start": rho_start,
         "rho_end": args.rho_end,
         "active_ratio": active_ratio,
@@ -477,10 +688,18 @@ def _configuration(
         "lora_scale": args.lora_scale,
         "remove_bg": bool(args.remove_bg),
         "base_model": args.base_model,
+        "base_model_revision": args.base_model_revision,
         "vae_model": args.vae_model,
+        "vae_model_revision": args.vae_model_revision,
         "unet_model": args.unet_model,
+        "unet_model_revision": args.unet_model_revision,
         "lora_model": args.lora_model,
+        "lora_model_revision": args.lora_model_revision,
         "adapter_path": args.adapter_path,
+        "adapter_revision": args.adapter_revision,
+        "adapter_sha256": args.adapter_sha256,
+        "birefnet_model": args.birefnet_model,
+        "birefnet_revision": args.birefnet_revision,
         "scheduler": args.scheduler,
         "device": args.device,
         "module": args.module,
@@ -505,10 +724,16 @@ def _build_command(args: argparse.Namespace, config: Mapping[str, Any], output: 
         str(config["guidance_scale"]),
         "--azimuth_deg",
         *[str(value) for value in config["azimuth_deg"]],
-        "--nile_mode",
-        str(config["nile_mode"]),
+        "--method",
+        str(config["inference_method"]),
         "--nile_callback",
         str(config["nile_callback"]),
+        "--max_correlation",
+        str(config["max_correlation"]),
+        "--frequency_scale",
+        str(config["frequency_scale"]),
+        "--camera_length_scale",
+        str(config["camera_length_scale"]),
         "--rho_geo",
         str(config["rho_geo"]),
         "--rho_start",
@@ -530,10 +755,25 @@ def _build_command(args: argparse.Namespace, config: Mapping[str, Any], output: 
     _add_optional(command, "--reference_conditioning_scale", config.get("reference_conditioning_scale"))
     _add_optional(command, "--lora_scale", config.get("lora_scale"))
     _add_optional(command, "--base_model", config.get("base_model"))
+    _add_optional(
+        command, "--base_model_revision", config.get("base_model_revision")
+    )
     _add_optional(command, "--vae_model", config.get("vae_model"))
+    _add_optional(command, "--vae_model_revision", config.get("vae_model_revision"))
     _add_optional(command, "--unet_model", config.get("unet_model"))
+    _add_optional(
+        command, "--unet_model_revision", config.get("unet_model_revision")
+    )
     _add_optional(command, "--lora_model", config.get("lora_model"))
+    _add_optional(
+        command, "--lora_model_revision", config.get("lora_model_revision")
+    )
     _add_optional(command, "--adapter_path", config.get("adapter_path"))
+    _add_optional(command, "--adapter_revision", config.get("adapter_revision"))
+    _add_optional(command, "--birefnet_model", config.get("birefnet_model"))
+    _add_optional(
+        command, "--birefnet_revision", config.get("birefnet_revision")
+    )
     _add_optional(command, "--scheduler", config.get("scheduler"))
     _add_optional(command, "--device", config.get("device"))
     if config.get("remove_bg"):
@@ -545,12 +785,29 @@ def _build_command(args: argparse.Namespace, config: Mapping[str, Any], output: 
 def main(argv: Optional[Sequence[str]] = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
+    repo_root = args.repo_root.expanduser().resolve()
+    if not repo_root.is_dir():
+        parser.error("--repo-root is not a directory: {}".format(repo_root))
+    try:
+        args.code_revision = (
+            str(args.code_revision).strip()
+            if args.code_revision is not None
+            else _detect_code_revision(repo_root)
+        )
+    except ValueError as error:
+        parser.error(str(error))
+    args.experiment_id = (
+        str(args.experiment_id).strip()
+        if args.experiment_id is not None
+        else "adhoc-{}".format(_slug(args.code_revision)[:40])
+    )
     try:
         _validate_args(args)
         images = _expand_inputs(_flatten(args.input), args.recursive, args.extensions)
         methods = _unique(_parse_method(item) for item in args.methods)
         args.seeds = _unique(args.seeds)
-        args.rhos = _unique(args.rhos)
+        args.strengths = _unique(args.strengths)
+        args.rhos = args.strengths
         args.rho_starts = _unique(args.rho_starts)
         args.active_ratios = _unique(args.active_ratios)
     except ValueError as error:
@@ -562,14 +819,24 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         if args.manifest is not None
         else output_root / "manifest.jsonl"
     )
-    repo_root = args.repo_root.expanduser().resolve()
-    if not repo_root.is_dir():
-        parser.error("--repo-root is not a directory: {}".format(repo_root))
-
     try:
         previous = _read_manifest(manifest_path)
     except (OSError, ValueError, json.JSONDecodeError) as error:
         parser.error("Could not read manifest {}: {}".format(manifest_path, error))
+
+    foreign_records = [
+        record
+        for record in previous
+        if record.get("experiment_id") != args.experiment_id
+        or record.get("code_revision") != args.code_revision
+    ]
+    if foreign_records:
+        parser.error(
+            "Manifest {} contains {} record(s) from a different experiment or "
+            "code revision; use a new isolated manifest path.".format(
+                manifest_path, len(foreign_records)
+            )
+        )
 
     records_by_id: MutableMapping[str, Dict[str, Any]] = {
         str(record.get("run_id")): record
@@ -586,15 +853,25 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         image_label = "{}-{}".format(_slug(image.stem), image_digest)
         for method in methods:
             label, mode, callback = method
-            method_rhos = list(args.rhos)
-            if not args.repeat_baseline_rhos and mode in {"iid", "shared", "flat_sobol"}:
-                method_rhos = [method_rhos[0]]
+            method_strengths = list(args.strengths)
+            strength_independent = {
+                "iid_default",
+                "iid_external",
+                "shared_full",
+                "iid",
+                "shared",
+                "flat_sobol",
+            }
+            if not args.repeat_baseline_rhos and mode in strength_independent:
+                # Correlation strength is not a parameter of these baselines;
+                # record zero rather than a misleading member of the sweep.
+                method_strengths = [0.0]
             method_rho_starts = args.rho_starts if callback != "none" else args.rho_starts[:1]
             method_active_ratios = (
                 args.active_ratios if callback != "none" else args.active_ratios[:1]
             )
             for seed in args.seeds:
-                for rho in method_rhos:
+                for strength in method_strengths:
                     for rho_start in method_rho_starts:
                         for active_ratio in method_active_ratios:
                             config = _configuration(
@@ -602,7 +879,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                                 image,
                                 method,
                                 seed,
-                                rho,
+                                strength,
                                 rho_start,
                                 active_ratio,
                             )
@@ -612,14 +889,16 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                                 / image_label
                                 / _slug(label)
                                 / "seed_{:06d}".format(seed)
-                                / "rho_{}__{}.png".format(_float_token(rho), run_id)
+                                / "strength_{}__{}.png".format(
+                                    _float_token(strength), run_id
+                                )
                             )
                             command = _build_command(args, config, output)
                             stem = output.with_suffix("")
                             record = dict(config)
                             record.update(
                                 {
-                                    "schema_version": 1,
+                                    "schema_version": 2,
                                     "run_id": run_id,
                                     "output": str(output),
                                     "metadata_path": str(stem) + "_metadata.json",

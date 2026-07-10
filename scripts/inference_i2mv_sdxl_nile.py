@@ -1,8 +1,8 @@
-"""MV-Adapter I2MV SDXL inference with the NILE-ViewTime prototype.
+"""MV-Adapter I2MV SDXL inference with view-correlated Gaussian latents.
 
-The low-discrepancy backend in this implementation is scrambled Sobol. It is
-an experiment scaffold, not the strict hierarchical NILE/SZ backend, which is
-kept as an explicit unimplemented interface in mvadapter.nile.sequence.
+The formal methods preserve each view's white-Gaussian marginal and only
+change cross-view covariance. Frozen Sobol, frequency-mismatched, and latent
+projection prototypes remain available solely for legacy failure analysis.
 """
 
 import argparse
@@ -18,7 +18,12 @@ from torchvision import transforms
 from transformers import AutoModelForImageSegmentation
 
 from mvadapter.nile.callbacks import NILECallbackConfig, NILEViewTimeCallback
+from mvadapter.nile.nested_elements import make_nested_tree_latents
 from mvadapter.nile.sampler import NILEConfig, make_initial_latents
+from mvadapter.nile.spectral_gaussian import (
+    make_camera_rbf_correlated_latents,
+    make_spectral_global_correlated_latents,
+)
 from mvadapter.pipelines.pipeline_mvadapter_i2mv_sdxl import (
     MVAdapterI2MVSDXLPipeline,
 )
@@ -27,8 +32,26 @@ from mvadapter.utils import make_image_grid
 from mvadapter.utils.geometry import get_plucker_embeds_from_cameras_ortho
 from mvadapter.utils.mesh_utils import get_orthogonal_camera
 
+try:
+    from scripts.diagnose_nile_latents import run_preflight
+except ModuleNotFoundError as error:
+    # Support direct ``python scripts/inference_i2mv_sdxl_nile.py`` execution
+    # as well as the preferred ``python -m scripts...`` entry point.
+    if error.name != "scripts":
+        raise
+    from diagnose_nile_latents import run_preflight
 
-NILE_MODES = (
+
+FORMAL_METHODS = (
+    "iid_default",
+    "iid_external",
+    "shared_full",
+    "spectral_global_corr",
+    "camera_rbf_corr",
+    "nested_tree_a",
+    "nested_tree_ab",
+)
+LEGACY_NILE_MODES = (
     "iid",
     "shared",
     "lowpass_shared",
@@ -36,7 +59,12 @@ NILE_MODES = (
     "nile_v",
     "nile_vtp",
 )
+ALL_METHODS = FORMAL_METHODS + LEGACY_NILE_MODES
 NILE_CALLBACK_MODES = ("none", "nile_vt", "nile_vtp")
+PREFLIGHT_BATCH_SIZE = 16
+PREFLIGHT_CHANNELS = 4
+PREFLIGHT_HEIGHT = 96
+PREFLIGHT_WIDTH = 96
 
 
 def prepare_pipeline(
@@ -49,15 +77,30 @@ def prepare_pipeline(
     num_views,
     device,
     dtype,
+    base_model_revision=None,
+    vae_model_revision=None,
+    unet_model_revision=None,
+    lora_model_revision=None,
+    adapter_revision=None,
 ):
     # Load VAE and U-Net overrides if provided.
     pipe_kwargs = {}
     if vae_model is not None:
-        pipe_kwargs["vae"] = AutoencoderKL.from_pretrained(vae_model)
+        vae_kwargs = {}
+        if vae_model_revision is not None:
+            vae_kwargs["revision"] = vae_model_revision
+        pipe_kwargs["vae"] = AutoencoderKL.from_pretrained(vae_model, **vae_kwargs)
     if unet_model is not None:
-        pipe_kwargs["unet"] = UNet2DConditionModel.from_pretrained(unet_model)
+        unet_kwargs = {}
+        if unet_model_revision is not None:
+            unet_kwargs["revision"] = unet_model_revision
+        pipe_kwargs["unet"] = UNet2DConditionModel.from_pretrained(
+            unet_model, **unet_kwargs
+        )
 
     pipe: MVAdapterI2MVSDXLPipeline
+    if base_model_revision is not None:
+        pipe_kwargs["revision"] = base_model_revision
     pipe = MVAdapterI2MVSDXLPipeline.from_pretrained(base_model, **pipe_kwargs)
 
     scheduler_class = None
@@ -73,16 +116,20 @@ def prepare_pipeline(
         scheduler_class=scheduler_class,
     )
     pipe.init_custom_adapter(num_views=num_views)
-    pipe.load_custom_adapter(
-        adapter_path, weight_name="mvadapter_i2mv_sdxl.safetensors"
-    )
+    adapter_kwargs = {"weight_name": "mvadapter_i2mv_sdxl.safetensors"}
+    if adapter_revision is not None:
+        adapter_kwargs["revision"] = adapter_revision
+    pipe.load_custom_adapter(adapter_path, **adapter_kwargs)
 
     pipe.to(device=device, dtype=dtype)
     pipe.cond_encoder.to(device=device, dtype=dtype)
 
     if lora_model is not None:
         model_, name_ = lora_model.rsplit("/", 1)
-        pipe.load_lora_weights(model_, weight_name=name_)
+        lora_kwargs = {"weight_name": name_}
+        if lora_model_revision is not None:
+            lora_kwargs["revision"] = lora_model_revision
+        pipe.load_lora_weights(model_, **lora_kwargs)
 
     # VAE slicing reduces peak memory without changing the generated samples.
     pipe.enable_vae_slicing()
@@ -144,10 +191,108 @@ def _effective_seed(seed: int) -> int:
     return 0 if seed == -1 else seed
 
 
+def _resolve_method(method, nile_mode):
+    if method is not None:
+        return method
+    if nile_mode is not None:
+        return nile_mode
+    return "iid_default"
+
+
 def _reference_vae_seed(seed: int) -> int:
     """Use a deterministic random stream disjoint from the NILE latent stream."""
 
     return (_effective_seed(seed) + 1_000_003) % (2**63 - 1)
+
+
+def _scheduler_seed(seed: int) -> int:
+    """Keep stochastic scheduler noise independent of latent construction."""
+
+    return (_effective_seed(seed) + 2_000_033) % (2**63 - 1)
+
+
+def _preflight_output_path(output: str) -> Path:
+    output_path = Path(output).expanduser()
+    return output_path.with_name(f"{output_path.stem}_preflight.json")
+
+
+def _preflight_summary(payload, report_path: Path):
+    """Keep generation metadata compact while retaining the full sidecar report."""
+
+    record = payload["record"]
+    report = record.get("report", {})
+    gates = record.get("gates", {})
+    summary = {
+        "applicable": True,
+        "passed": bool(payload["passed"]),
+        "report": str(report_path.resolve()),
+        "schema_version": payload.get("schema_version"),
+        "config": payload.get("config"),
+        "checks": gates.get("checks"),
+    }
+    if "error" in record:
+        summary["error"] = record["error"]
+    if report:
+        summary["metrics"] = {
+            "global": report.get("global"),
+            "max_abs_lag_autocorrelation": report.get(
+                "lag_autocorrelation", {}
+            ).get("max_abs"),
+            "max_radial_psd_deviation": report.get(
+                "per_view_radial_psd_deviation", {}
+            ).get("max"),
+            "max_axis_stripe_score": report.get("axis_stripe_score", {}).get(
+                "max"
+            ),
+            "cross_view_covariance_error": report.get(
+                "cross_view_covariance_error"
+            ),
+        }
+    return summary
+
+
+def _run_required_preflight(args):
+    """Gate every formal CLI run before any diffusion weights are loaded."""
+
+    if args.resolved_method not in FORMAL_METHODS:
+        return {
+            "applicable": False,
+            "passed": None,
+            "reason": "legacy_failure_analysis_method",
+        }
+
+    report_path = _preflight_output_path(args.output)
+    payload = run_preflight(
+        args.resolved_method,
+        view_angles=args.azimuth_deg,
+        seed=_effective_seed(args.seed),
+        max_correlation=args.max_correlation,
+        frequency_scale=args.frequency_scale,
+        camera_length_scale=args.camera_length_scale,
+        batch_size=PREFLIGHT_BATCH_SIZE,
+        channels=PREFLIGHT_CHANNELS,
+        height=PREFLIGHT_HEIGHT,
+        width=PREFLIGHT_WIDTH,
+        device=args.device,
+        output=report_path,
+    )
+    summary = _preflight_summary(payload, report_path)
+    if not payload["passed"]:
+        record = payload["record"]
+        if "error" in record:
+            failure = record["error"]
+        else:
+            failure = ", ".join(
+                name
+                for name, check in record["gates"]["checks"].items()
+                if not check["passed"]
+            )
+        raise RuntimeError(
+            "formal latent distribution preflight failed for {}: {}. "
+            "Report: {}".format(args.resolved_method, failure, report_path)
+        )
+    print(f"Preflight: {report_path}")
+    return summary
 
 
 def _validate_nile_configuration(
@@ -156,7 +301,7 @@ def _validate_nile_configuration(
     height,
     width,
     vae_scale_factor,
-    nile_mode,
+    method,
     nile_callback,
     rho_geo,
     rho_start,
@@ -169,6 +314,9 @@ def _validate_nile_configuration(
     callback_blur_kernel,
     callback_blur_sigma,
     zindex_strength,
+    max_correlation,
+    frequency_scale,
+    camera_length_scale,
 ):
     if num_views <= 0:
         raise ValueError("num_views must be positive")
@@ -179,10 +327,36 @@ def _validate_nile_configuration(
             "height and width must be divisible by pipe.vae_scale_factor "
             f"({vae_scale_factor})"
         )
-    if nile_mode not in NILE_MODES:
-        raise ValueError(f"unsupported NILE mode: {nile_mode}")
+    if method not in ALL_METHODS:
+        raise ValueError(f"unsupported sampler method: {method}")
     if nile_callback not in NILE_CALLBACK_MODES:
         raise ValueError(f"unsupported NILE callback mode: {nile_callback}")
+    if method in FORMAL_METHODS and nile_callback != "none":
+        raise ValueError(
+            "formal distribution-preserving methods prohibit legacy latent callbacks"
+        )
+    if method in FORMAL_METHODS:
+        valid_correlation = (
+            math.isfinite(max_correlation) and 0.0 <= max_correlation < 1.0
+        )
+        correlation_interval = "[0, 1)"
+    else:
+        # Legacy methods ignore this new field; accepting one preserves old
+        # --rhos 1.0 grid commands while rho_geo remains independently checked.
+        valid_correlation = (
+            math.isfinite(max_correlation) and 0.0 <= max_correlation <= 1.0
+        )
+        correlation_interval = "[0, 1]"
+    if not valid_correlation:
+        raise ValueError(
+            f"max_correlation must be in {correlation_interval}, got {max_correlation}"
+        )
+    if not math.isfinite(frequency_scale) or frequency_scale <= 0.0:
+        raise ValueError(f"frequency_scale must be positive, got {frequency_scale}")
+    if not math.isfinite(camera_length_scale) or camera_length_scale <= 0.0:
+        raise ValueError(
+            f"camera_length_scale must be positive, got {camera_length_scale}"
+        )
 
     for name, value in (
         ("rho_geo", rho_geo),
@@ -239,7 +413,8 @@ def run_pipeline(
     lora_scale=1.0,
     device="cuda",
     azimuth_deg=None,
-    nile_mode="iid",
+    method=None,
+    nile_mode=None,
     nile_callback="none",
     rho_geo=0.65,
     rho_start=0.45,
@@ -254,6 +429,9 @@ def run_pipeline(
     callback_blur_sigma=2.0,
     zindex_strength=0.25,
     preserve_marginal=True,
+    max_correlation=0.45,
+    frequency_scale=0.12,
+    camera_length_scale=0.8,
 ):
     if azimuth_deg is None:
         azimuth_deg = [0, 45, 90, 180, 270, 315]
@@ -264,13 +442,14 @@ def run_pipeline(
     if num_inference_steps <= 0:
         raise ValueError("num_inference_steps must be positive")
 
+    selected_method = _resolve_method(method, nile_mode)
     vae_scale_factor = int(pipe.vae_scale_factor)
     _validate_nile_configuration(
         num_views=num_views,
         height=height,
         width=width,
         vae_scale_factor=vae_scale_factor,
-        nile_mode=nile_mode,
+        method=selected_method,
         nile_callback=nile_callback,
         rho_geo=rho_geo,
         rho_start=rho_start,
@@ -283,6 +462,9 @@ def run_pipeline(
         callback_blur_kernel=callback_blur_kernel,
         callback_blur_sigma=callback_blur_sigma,
         zindex_strength=zindex_strength,
+        max_correlation=max_correlation,
+        frequency_scale=frequency_scale,
+        camera_length_scale=camera_length_scale,
     )
 
     # Prepare cameras and per-view Plucker controls exactly as in the original
@@ -317,39 +499,111 @@ def run_pipeline(
     execution_device = pipe._execution_device
     latent_dtype = pipe.unet.dtype
 
-    nile_cfg = NILEConfig(
-        mode=nile_mode,
-        seed=_effective_seed(seed),
-        rho_geo=rho_geo,
-        blur_kernel=blur_kernel,
-        blur_sigma=blur_sigma,
-        patch_size=patch_size,
-        qmc_scramble=qmc_scramble,
-        qmc_dim=qmc_dim,
-    )
-    latents = make_initial_latents(
-        batch_size=batch_size,
-        num_views=num_views,
-        channels=channels,
-        latent_h=latent_h,
-        latent_w=latent_w,
-        device=execution_device,
-        dtype=latent_dtype,
-        cfg=nile_cfg,
-    )
     expected_shape = (batch_size * num_views, channels, latent_h, latent_w)
-    if tuple(latents.shape) != expected_shape:
-        raise ValueError(
-            "NILE sampler returned an invalid latent shape: "
-            f"expected {expected_shape}, got {tuple(latents.shape)}"
-        )
-
-    # Custom initial latents remain owned by NILE. The pipeline generator is
-    # still needed to make sampling the reference-image VAE posterior
-    # deterministic and identical across sampler baselines.
-    pipeline_generator = torch.Generator(device=execution_device).manual_seed(
+    latent_generator = torch.Generator(device=execution_device).manual_seed(
+        _effective_seed(seed)
+    )
+    reference_generator = torch.Generator(device=execution_device).manual_seed(
         _reference_vae_seed(seed)
     )
+    scheduler_generator = torch.Generator(device=execution_device).manual_seed(
+        _scheduler_seed(seed)
+    )
+
+    latents = None
+    if selected_method == "iid_default":
+        # Deliberately omit external latents. The pipeline consumes exactly the
+        # same latent_generator stream that iid_external consumes below.
+        pass
+    elif selected_method == "iid_external":
+        latents = torch.randn(
+            expected_shape,
+            generator=latent_generator,
+            device=execution_device,
+            dtype=latent_dtype,
+        )
+    elif selected_method == "shared_full":
+        shared = torch.randn(
+            (batch_size, channels, latent_h, latent_w),
+            generator=latent_generator,
+            device=execution_device,
+            dtype=latent_dtype,
+        )
+        latents = shared[:, None].expand(
+            batch_size, num_views, channels, latent_h, latent_w
+        ).reshape(expected_shape)
+    elif selected_method == "spectral_global_corr":
+        latents = make_spectral_global_correlated_latents(
+            batch_size,
+            num_views,
+            channels,
+            latent_h,
+            latent_w,
+            device=execution_device,
+            dtype=latent_dtype,
+            generator=latent_generator,
+            max_correlation=max_correlation,
+            frequency_scale=frequency_scale,
+        )
+    elif selected_method == "camera_rbf_corr":
+        latents = make_camera_rbf_correlated_latents(
+            batch_size,
+            num_views,
+            channels,
+            latent_h,
+            latent_w,
+            azimuth_deg,
+            device=execution_device,
+            dtype=latent_dtype,
+            generator=latent_generator,
+            max_correlation=max_correlation,
+            frequency_scale=frequency_scale,
+            length_scale=camera_length_scale,
+        )
+    elif selected_method in {"nested_tree_a", "nested_tree_ab"}:
+        latents = make_nested_tree_latents(
+            batch_size,
+            num_views,
+            channels,
+            latent_h,
+            latent_w,
+            azimuth_deg,
+            device=execution_device,
+            dtype=latent_dtype,
+            generator=latent_generator,
+            max_correlation=max_correlation,
+            frequency_scale=frequency_scale,
+            tree_mode="a" if selected_method == "nested_tree_a" else "ab",
+        )
+    else:
+        # Frozen v0 failure-analysis path. It is intentionally excluded from
+        # the formal default matrix and distribution gate.
+        legacy_cfg = NILEConfig(
+            mode=selected_method,
+            seed=_effective_seed(seed),
+            rho_geo=rho_geo,
+            blur_kernel=blur_kernel,
+            blur_sigma=blur_sigma,
+            patch_size=patch_size,
+            qmc_scramble=qmc_scramble,
+            qmc_dim=qmc_dim,
+        )
+        latents = make_initial_latents(
+            batch_size=batch_size,
+            num_views=num_views,
+            channels=channels,
+            latent_h=latent_h,
+            latent_w=latent_w,
+            device=execution_device,
+            dtype=latent_dtype,
+            cfg=legacy_cfg,
+        )
+
+    if latents is not None and tuple(latents.shape) != expected_shape:
+        raise ValueError(
+            "sampler returned an invalid latent shape: "
+            f"expected {expected_shape}, got {tuple(latents.shape)}"
+        )
 
     pipeline_kwargs = {
         "prompt": text,
@@ -364,9 +618,12 @@ def run_pipeline(
         "reference_conditioning_scale": reference_conditioning_scale,
         "negative_prompt": negative_prompt,
         "cross_attention_kwargs": {"scale": lora_scale},
-        "latents": latents,
-        "generator": pipeline_generator,
+        "generator": latent_generator,
+        "reference_generator": reference_generator,
+        "scheduler_generator": scheduler_generator,
     }
+    if latents is not None:
+        pipeline_kwargs["latents"] = latents
 
     if nile_callback != "none":
         callback_cfg = NILECallbackConfig(
@@ -430,21 +687,37 @@ def _save_outputs(images, reference_image, args):
         "seed": args.seed,
         "effective_seed": _effective_seed(args.seed),
         "reference_vae_seed": _reference_vae_seed(args.seed),
-        "mode": args.nile_mode,
+        "method": args.resolved_method,
+        "max_correlation": args.max_correlation,
+        "frequency_scale": args.frequency_scale,
+        "camera_length_scale": args.camera_length_scale,
+        "mode": args.resolved_method,
         "callback": args.nile_callback,
         "rho_geo": args.rho_geo,
         "rho_start": args.rho_start,
         "rho_end": args.rho_end,
+        "preflight": getattr(
+            args,
+            "preflight_summary",
+            {"applicable": False, "passed": None, "reason": "not_recorded"},
+        ),
         "input": {
             "image": str(Path(args.image).expanduser().resolve()),
             "text": args.text,
         },
         "models": {
             "base_model": args.base_model,
+            "base_model_revision": args.base_model_revision,
             "vae_model": args.vae_model,
+            "vae_model_revision": args.vae_model_revision,
             "unet_model": args.unet_model,
+            "unet_model_revision": args.unet_model_revision,
             "lora_model": args.lora_model,
+            "lora_model_revision": args.lora_model_revision,
             "adapter_path": args.adapter_path,
+            "adapter_revision": args.adapter_revision,
+            "birefnet_model": args.birefnet_model,
+            "birefnet_revision": args.birefnet_revision,
             "scheduler": args.scheduler,
         },
         "inference": {
@@ -455,6 +728,21 @@ def _save_outputs(images, reference_image, args):
             "negative_prompt": args.negative_prompt,
             "reference_conditioning_scale": args.reference_conditioning_scale,
             "lora_scale": args.lora_scale,
+        },
+        "distribution": {
+            "method": args.resolved_method,
+            "formal_method": args.resolved_method in FORMAL_METHODS,
+            "external_latents": args.resolved_method != "iid_default",
+            "max_correlation": args.max_correlation,
+            "frequency_scale": args.frequency_scale,
+            "camera_length_scale": args.camera_length_scale,
+            "latent_generator_seed": _effective_seed(args.seed),
+            "reference_generator_seed": _reference_vae_seed(args.seed),
+            "reference_generator_is_independent": True,
+            "scheduler_generator_seed": _scheduler_seed(args.seed),
+            "scheduler_generator_is_independent": True,
+            "callback_allowed": args.resolved_method not in FORMAL_METHODS,
+            "per_sample_standardization": False,
         },
         "nile": {
             "mode": args.nile_mode,
@@ -470,12 +758,12 @@ def _save_outputs(images, reference_image, args):
             "qmc_dim": args.qmc_dim,
             "effective_qmc_dim": (
                 1
-                if args.nile_mode in {"flat_sobol", "nile_v", "nile_vtp"}
+                if args.resolved_method in {"flat_sobol", "nile_v", "nile_vtp"}
                 else None
             ),
             "effective_qmc_scramble": (
                 args.qmc_scramble
-                if args.nile_mode in {"flat_sobol", "nile_v", "nile_vtp"}
+                if args.resolved_method in {"flat_sobol", "nile_v", "nile_vtp"}
                 else None
             ),
             "qmc_dim_status": "reserved_for_strict_sz",
@@ -485,7 +773,7 @@ def _save_outputs(images, reference_image, args):
             "preserve_marginal": args.preserve_marginal,
             "sequence_backend": (
                 "sobol_prototype"
-                if args.nile_mode in {"flat_sobol", "nile_v", "nile_vtp"}
+                if args.resolved_method in {"flat_sobol", "nile_v", "nile_vtp"}
                 else "pseudorandom"
             ),
             "strict_sz_implemented": False,
@@ -493,7 +781,7 @@ def _save_outputs(images, reference_image, args):
                 "For lowpass_shared/nile_v/nile_vtp, the prompt-defined "
                 "formula yields standardized local high-pass noise at "
                 "rho_geo=0; use the explicit iid mode as the IID baseline."
-                if args.nile_mode in {"lowpass_shared", "nile_v", "nile_vtp"}
+                if args.resolved_method in {"lowpass_shared", "nile_v", "nile_vtp"}
                 else None
             ),
         },
@@ -517,13 +805,20 @@ def _build_parser():
     parser.add_argument(
         "--base_model", type=str, default="stabilityai/stable-diffusion-xl-base-1.0"
     )
+    parser.add_argument("--base_model_revision", type=str, default=None)
     parser.add_argument(
         "--vae_model", type=str, default="madebyollin/sdxl-vae-fp16-fix"
     )
+    parser.add_argument("--vae_model_revision", type=str, default=None)
     parser.add_argument("--unet_model", type=str, default=None)
+    parser.add_argument("--unet_model_revision", type=str, default=None)
     parser.add_argument("--scheduler", type=str, default=None)
     parser.add_argument("--lora_model", type=str, default=None)
+    parser.add_argument("--lora_model_revision", type=str, default=None)
     parser.add_argument("--adapter_path", type=str, default="huanngzh/mv-adapter")
+    parser.add_argument("--adapter_revision", type=str, default=None)
+    parser.add_argument("--birefnet_model", type=str, default="ZhengPeng7/BiRefNet")
+    parser.add_argument("--birefnet_revision", type=str, default=None)
 
     # Device
     parser.add_argument("--device", type=str, default="cuda")
@@ -552,8 +847,18 @@ def _build_parser():
     )
     parser.add_argument("--output", type=str, default="output.png")
 
-    # NILE initial sampler
-    parser.add_argument("--nile_mode", choices=NILE_MODES, default="iid")
+    # Formal sampler selection. The old --nile_mode entry point remains
+    # available exclusively for reproducing the frozen failure-analysis paths.
+    parser.add_argument("--method", choices=ALL_METHODS, default=None)
+    parser.add_argument(
+        "--nile_mode",
+        choices=LEGACY_NILE_MODES,
+        default=None,
+        help="Legacy v0 sampler selector; excluded from the formal matrix.",
+    )
+    parser.add_argument("--max_correlation", type=float, default=0.45)
+    parser.add_argument("--frequency_scale", type=float, default=0.12)
+    parser.add_argument("--camera_length_scale", type=float, default=0.8)
     parser.add_argument("--rho_geo", type=float, default=0.65)
     parser.add_argument("--blur_kernel", type=int, default=11)
     parser.add_argument("--blur_sigma", type=float, default=2.5)
@@ -619,6 +924,9 @@ def _build_parser():
 
 
 def _validate_cli_args(parser, args):
+    if args.method is not None and args.nile_mode is not None:
+        parser.error("use either --method or legacy --nile_mode, not both")
+    args.resolved_method = _resolve_method(args.method, args.nile_mode)
     image_path = Path(args.image).expanduser()
     if not image_path.is_file():
         parser.error(f"input image does not exist: {image_path}")
@@ -641,7 +949,7 @@ def _validate_cli_args(parser, args):
             height=768,
             width=768,
             vae_scale_factor=8,
-            nile_mode=args.nile_mode,
+            method=args.resolved_method,
             nile_callback=args.nile_callback,
             rho_geo=args.rho_geo,
             rho_start=args.rho_start,
@@ -654,6 +962,9 @@ def _validate_cli_args(parser, args):
             callback_blur_kernel=args.callback_blur_kernel,
             callback_blur_sigma=args.callback_blur_sigma,
             zindex_strength=args.zindex_strength,
+            max_correlation=args.max_correlation,
+            frequency_scale=args.frequency_scale,
+            camera_length_scale=args.camera_length_scale,
         )
     except ValueError as error:
         parser.error(str(error))
@@ -665,6 +976,7 @@ def main():
     _validate_cli_args(parser, args)
 
     num_views = len(args.azimuth_deg)
+    args.preflight_summary = _run_required_preflight(args)
     pipe = prepare_pipeline(
         base_model=args.base_model,
         vae_model=args.vae_model,
@@ -675,11 +987,19 @@ def main():
         num_views=num_views,
         device=args.device,
         dtype=torch.float16 if args.device.startswith("cuda") else torch.float32,
+        base_model_revision=args.base_model_revision,
+        vae_model_revision=args.vae_model_revision,
+        unet_model_revision=args.unet_model_revision,
+        lora_model_revision=args.lora_model_revision,
+        adapter_revision=args.adapter_revision,
     )
 
     if args.remove_bg:
+        birefnet_kwargs = {"trust_remote_code": True}
+        if args.birefnet_revision is not None:
+            birefnet_kwargs["revision"] = args.birefnet_revision
         birefnet = AutoModelForImageSegmentation.from_pretrained(
-            "ZhengPeng7/BiRefNet", trust_remote_code=True
+            args.birefnet_model, **birefnet_kwargs
         )
         birefnet.to(args.device)
         transform_image = transforms.Compose(
@@ -711,6 +1031,7 @@ def main():
         device=args.device,
         remove_bg_fn=remove_bg_fn,
         azimuth_deg=args.azimuth_deg,
+        method=args.resolved_method,
         nile_mode=args.nile_mode,
         nile_callback=args.nile_callback,
         rho_geo=args.rho_geo,
@@ -726,6 +1047,9 @@ def main():
         callback_blur_sigma=args.callback_blur_sigma,
         zindex_strength=args.zindex_strength,
         preserve_marginal=args.preserve_marginal,
+        max_correlation=args.max_correlation,
+        frequency_scale=args.frequency_scale,
+        camera_length_scale=args.camera_length_scale,
     )
     output_path, reference_path, views_dir, metadata_path = _save_outputs(
         images, reference_image, args
