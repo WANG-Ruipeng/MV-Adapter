@@ -101,7 +101,7 @@ def _load_config(path: Path) -> Dict[str, Any]:
 
 
 def build_pilot_configurations(config: Mapping[str, Any]) -> List[Dict[str, Any]]:
-    """Build the exact 18-row matrix and IDs used by the study runner."""
+    """Build the configured PILOT matrix and IDs used by the study runner."""
 
     pilot = config["pilot"]
     configurations: List[Dict[str, Any]] = [
@@ -144,10 +144,11 @@ def build_pilot_configurations(config: Mapping[str, Any]) -> List[Dict[str, Any]
     for item in configurations:
         item["config_id"] = _configuration_id(item)
     expected = int(pilot.get("expected_configs_per_input_seed", 18))
-    if len(configurations) != expected or expected != 18:
+    if len(configurations) != expected:
         raise ValueError(
-            "the formal PILOT preflight must contain exactly 18 configurations; "
-            "built {} and config expected {}".format(len(configurations), expected)
+            "PILOT preflight built {} configurations but config expected {}".format(
+                len(configurations), expected
+            )
         )
     return configurations
 
@@ -980,15 +981,18 @@ def run_study_preflight(
     coefficient_min_observations: int = DEFAULT_COEFFICIENT_MIN_OBSERVATIONS,
     plots: bool = True,
 ) -> Dict[str, Any]:
-    """Run and persist all 18 formal preflight configurations."""
+    """Run and persist every configuration in the requested preflight matrix."""
 
     configurations = build_pilot_configurations(config)
     basis_cache: Dict[int, Tuple[torch.Tensor, Dict[str, Any]]] = {}
     records = []
     for index, configuration in enumerate(configurations, start=1):
         print(
-            "[preflight {}/18] {} {}".format(
-                index, configuration["method"], configuration["config_id"]
+            "[preflight {}/{}] {} {}".format(
+                index,
+                len(configurations),
+                configuration["method"],
+                configuration["config_id"],
             ),
             flush=True,
         )

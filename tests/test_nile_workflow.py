@@ -828,6 +828,48 @@ class CheckpointProvenanceTests(unittest.TestCase):
                 "adapter_sha256_file_manifest_mismatch", hash_audit["issues"]
             )
 
+    def test_drive_metadata_change_during_hash_is_not_content_tampering(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            checkpoint = root / "mvadapter_i2mv_sdxl.safetensors"
+            checkpoint.write_bytes(b"verified adapter bytes")
+            sha256 = hashlib.sha256(checkpoint.read_bytes()).hexdigest()
+            config = self._frozen_config(sha256)
+            manifest_path = root / "checkpoint_manifest.json"
+            manifest_path.write_text(
+                json.dumps(self._manifest(config, checkpoint, sha256)),
+                encoding="utf-8",
+            )
+            before = {
+                "declared_path": str(checkpoint),
+                "resolved_path": str(checkpoint.resolve()),
+                "size": checkpoint.stat().st_size,
+                "mtime_ns": 1,
+                "ctime_ns": 1,
+            }
+            metadata_only = {**before, "mtime_ns": 2, "ctime_ns": 3}
+            with mock.patch(
+                "scripts.run_nile_lowrank_study._checkpoint_file_identity",
+                side_effect=[before, metadata_only],
+            ):
+                audit = audit_checkpoint_manifest(manifest_path, config)
+            self.assertTrue(audit["verified"], audit)
+            self.assertTrue(audit["checkpoint_metadata_changed_during_hash"])
+            self.assertNotIn(
+                "adapter_checkpoint_changed_during_hash", audit["issues"]
+            )
+
+            content_identity_change = {**before, "size": before["size"] + 1}
+            with mock.patch(
+                "scripts.run_nile_lowrank_study._checkpoint_file_identity",
+                side_effect=[before, content_identity_change],
+            ):
+                changed = audit_checkpoint_manifest(manifest_path, config)
+            self.assertFalse(changed["verified"])
+            self.assertIn(
+                "adapter_checkpoint_changed_during_hash", changed["issues"]
+            )
+
     def test_checkpoint_provenance_blocker_requires_verified_audit(self):
         config = self._frozen_config("a" * 64)
         input_validation = {"formal_ready": True}

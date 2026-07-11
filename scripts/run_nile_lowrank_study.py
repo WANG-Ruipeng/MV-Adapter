@@ -1614,7 +1614,24 @@ def run_preflight_stage(root: Path, config: Mapping[str, Any]) -> Dict[str, Any]
         "--output-dir",
         str(root / "distribution_gates"),
     ]
-    process = subprocess.run(command, check=False)
+    process = subprocess.run(
+        command,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    log_path = root / "distribution_gates" / "preflight.log"
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    _atomic_text(
+        log_path,
+        "COMMAND\n{}\n\nSTDOUT\n{}\n\nSTDERR\n{}\n".format(
+            json.dumps(command), process.stdout or "", process.stderr or ""
+        ),
+    )
+    if process.stdout:
+        print(process.stdout, end="")
+    if process.stderr:
+        print(process.stderr, end="", file=sys.stderr)
     output = root / "distribution_gates" / "configuration_gates.json"
     payload = json.loads(output.read_text(encoding="utf-8")) if output.exists() else {
         "passed": False,
@@ -1623,6 +1640,9 @@ def run_preflight_stage(root: Path, config: Mapping[str, Any]) -> Dict[str, Any]
     }
     payload["returncode"] = process.returncode
     payload["completed"] = process.returncode == 0 and output.exists()
+    payload["log_path"] = str(log_path)
+    if process.returncode != 0:
+        payload["stderr_tail"] = (process.stderr or "")[-8000:]
     return payload
 
 
@@ -1754,6 +1774,20 @@ def _checkpoint_file_identity(path: Path) -> Optional[Dict[str, Any]]:
     }
 
 
+def _checkpoint_stable_identity(
+    identity: Optional[Mapping[str, Any]],
+) -> Optional[Dict[str, Any]]:
+    """Return fields that indicate content replacement, excluding FUSE metadata."""
+
+    if not isinstance(identity, Mapping):
+        return None
+    return {
+        "declared_path": identity.get("declared_path"),
+        "resolved_path": identity.get("resolved_path"),
+        "size": identity.get("size"),
+    }
+
+
 def audit_checkpoint_manifest(
     path: Path,
     config: Mapping[str, Any],
@@ -1872,6 +1906,8 @@ def audit_checkpoint_manifest(
     checkpoint = checkpoint_entry
     actual_sha256 = None
     identity_before_hash = checkpoint_identity
+    identity_after_hash = checkpoint_identity
+    checkpoint_metadata_changed_during_hash = False
     if not isinstance(checkpoint, Mapping):
         issues.append("adapter_checkpoint_manifest_missing")
     else:
@@ -1891,8 +1927,15 @@ def audit_checkpoint_manifest(
                 except Exception as error:
                     issues.append("adapter_checkpoint_hash_failed")
                     result["hash_error"] = repr(error)
-                if _checkpoint_file_identity(checkpoint_path) != identity_before_hash:
+                identity_after_hash = _checkpoint_file_identity(checkpoint_path)
+                checkpoint_metadata_changed_during_hash = (
+                    identity_after_hash != identity_before_hash
+                )
+                if _checkpoint_stable_identity(
+                    identity_after_hash
+                ) != _checkpoint_stable_identity(identity_before_hash):
                     issues.append("adapter_checkpoint_changed_during_hash")
+                cache_key["checkpoint_file"] = identity_after_hash
         manifest_sha256 = str(checkpoint.get("sha256") or "").lower()
         config_sha256 = str(model.get("adapter_sha256") or "").lower()
         if manifest_sha256 != config_sha256:
@@ -1909,6 +1952,11 @@ def audit_checkpoint_manifest(
                 str(checkpoint_path) if checkpoint_path is not None else None
             ),
             "actual_adapter_sha256": actual_sha256,
+            "checkpoint_identity_before_hash": identity_before_hash,
+            "checkpoint_identity_after_hash": identity_after_hash,
+            "checkpoint_metadata_changed_during_hash": (
+                checkpoint_metadata_changed_during_hash
+            ),
             "manifest_content_sha256": manifest_content_sha256,
             "config_hash": resolved_config_hash,
             "cache_hit": False,

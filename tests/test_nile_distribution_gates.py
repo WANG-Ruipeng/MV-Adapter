@@ -56,6 +56,31 @@ def _study_config():
 
 
 class LowRankDistributionGateTests(unittest.TestCase):
+    def test_quick_demo_matrix_matches_runner_without_requiring_eighteen_rows(self):
+        config = _study_config()
+        config["pilot"].update(
+            {
+                "ranks": [8],
+                "target_kls": [1.0],
+                "rbf_length_scales_deg": [45.0],
+                "expected_configs_per_input_seed": 5,
+            }
+        )
+        diagnostic = build_pilot_configurations(config)
+        runner = runner_pilot_configurations(config)
+        self.assertEqual(len(diagnostic), 5)
+        self.assertEqual(diagnostic, runner)
+        self.assertEqual(
+            [item["method"] for item in diagnostic],
+            [
+                "iid_external",
+                "shared_full",
+                "lowrank_camera_rbf",
+                "lowrank_nested_tree_a",
+                "lowrank_nested_tree_ab",
+            ],
+        )
+
     def test_cli_uses_configured_coefficient_observation_count(self):
         config = _study_config()
         config["preflight"]["coefficient_min_observations"] = 1234

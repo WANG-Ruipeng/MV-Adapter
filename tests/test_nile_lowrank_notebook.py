@@ -36,8 +36,9 @@ class NileLowrankNotebookContractTests(unittest.TestCase):
         for literal in (
             "RUN_ALL = True",
             "RESUME = True",
-            "RUN_MET3R = True",
-            "FULL_MODE = True",
+            'RUN_PROFILE = "OFFICIAL_DEMO_QUICK"',
+            'FULL_MODE = RUN_PROFILE == "FORMAL_FULL"',
+            "RUN_MET3R = FULL_MODE",
             "--config",
             "str(FROZEN_CONFIG)",
             "--output-root",
@@ -48,6 +49,43 @@ class NileLowrankNotebookContractTests(unittest.TestCase):
         ):
             self.assertIn(literal, self.joined)
         self.assertNotIn("experiment-id", self.joined.lower())
+
+    def test_official_demo_quick_profile_is_small_isolated_and_non_formal(self):
+        configuration = self.sources[0]
+        clone_and_inputs = self.sources[2]
+        freeze = self.sources[5]
+        display = self.sources[17]
+        for literal in (
+            'DRIVE_BASE / "nile_lowrank_official_demo_quick"',
+            'INPUT_DIR = DRIVE_PROJECT_ROOT / "inputs"',
+            "3 official images x 1 seed x 5 methods = 15 runs",
+            "not a formal FULL result",
+        ):
+            self.assertIn(literal, configuration)
+        for filename in (
+            "A_decorative_figurine_of_a_young_anime-style_girl.png",
+            "A_juvenile_emperor_penguin_chick.png",
+            "A_striped_tabby_cat_with_white_fur_sitting_upright.png",
+        ):
+            self.assertIn(filename, clone_and_inputs)
+        for literal in (
+            '"pilot_count": 3',
+            '"full_count": 0',
+            '"min_distinct_inputs": 3',
+            '"seeds": [0]',
+            '"ranks": [8]',
+            '"target_kls": [1.0]',
+            '"rbf_length_scales_deg": [45.0]',
+            '"expected_configs_per_input_seed": 5',
+            'resolved_config["runtime"]["min_free_disk_gib"] = 10.0',
+        ):
+            self.assertIn(literal, freeze)
+        self.assertIn(
+            'run_stage("select", enabled=FULL_MODE and RUN_MET3R)',
+            self.sources[11],
+        )
+        self.assertIn("Official demo quick results:", display)
+        self.assertIn("FULL remains incomplete", display)
 
     def test_actual_hashed_runner_root_is_used_for_every_artifact(self):
         freeze_cell = self.sources[5]
@@ -195,6 +233,10 @@ class NileLowrankNotebookContractTests(unittest.TestCase):
             '"command"',
             '"test_results.json"',
             "os.replace(temporary, destination)",
+            '"--deselect"',
+            "test_notebook_is_clean_and_unexecuted",
+            '"full_repository_pytest_returncode"',
+            '"known_preexisting_failures"',
         ):
             self.assertIn(literal, self.sources[7])
         self.assertNotIn(
