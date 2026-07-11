@@ -25,6 +25,7 @@ import importlib
 import json
 import math
 import os
+import sys
 import traceback
 from argparse import Namespace
 from dataclasses import dataclass
@@ -40,6 +41,28 @@ LOWRANK_METHODS = (
     "lowrank_nested_tree_ab",
 )
 FORMAL_METHODS = ("iid_external", "shared_full") + LOWRANK_METHODS
+
+
+def install_timm_layers_compatibility() -> str:
+    """Expose the modern timm.layers path for legacy timm releases.
+
+    The pinned official MEt3R dependency installs timm 0.4.12, while the
+    frozen BiRefNet remote module imports the same symbols from timm.layers.
+    Legacy timm exposes them as timm.models.layers. Alias only that missing
+    module path and preserve every other import error.
+    """
+
+    try:
+        importlib.import_module("timm.layers")
+    except ModuleNotFoundError as error:
+        if error.name != "timm.layers":
+            raise
+        legacy_layers = importlib.import_module("timm.models.layers")
+        timm_module = importlib.import_module("timm")
+        sys.modules["timm.layers"] = legacy_layers
+        setattr(timm_module, "layers", legacy_layers)
+        return "legacy_timm.models.layers_alias"
+    return "native_timm.layers"
 
 
 def _utc_now() -> str:
@@ -389,6 +412,7 @@ class DefaultInferenceBackend:
         self, model: Mapping[str, Any]
     ) -> Tuple[Optional[Any], Any]:
         device = str(model.get("device", "cuda"))
+        install_timm_layers_compatibility()
         kwargs: Dict[str, Any] = {"trust_remote_code": True}
         if model.get("birefnet_revision") is not None:
             kwargs["revision"] = model["birefnet_revision"]

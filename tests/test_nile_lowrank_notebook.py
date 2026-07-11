@@ -36,8 +36,10 @@ class NileLowrankNotebookContractTests(unittest.TestCase):
         for literal in (
             "RUN_ALL = True",
             "RESUME = True",
-            'RUN_PROFILE = "OFFICIAL_DEMO_QUICK"',
-            'FULL_MODE = RUN_PROFILE == "FORMAL_FULL"',
+            'RUN_PROFILE = "OFFICIAL_DEMO_FULL"',
+            'OFFICIAL_DEMO_PROFILE = OFFICIAL_DEMO_QUICK or OFFICIAL_DEMO_FULL',
+            'FULL_MODE = RUN_PROFILE in {"OFFICIAL_DEMO_FULL", "FORMAL_FULL"}',
+            'FORMAL_RESULT = RUN_PROFILE == "FORMAL_FULL"',
             "RUN_MET3R = FULL_MODE",
             "--config",
             "str(FROZEN_CONFIG)",
@@ -50,16 +52,17 @@ class NileLowrankNotebookContractTests(unittest.TestCase):
             self.assertIn(literal, self.joined)
         self.assertNotIn("experiment-id", self.joined.lower())
 
-    def test_official_demo_quick_profile_is_small_isolated_and_non_formal(self):
+    def test_official_demo_full_profile_is_isolated_complete_and_non_formal(self):
         configuration = self.sources[0]
         clone_and_inputs = self.sources[2]
         freeze = self.sources[5]
         display = self.sources[17]
         for literal in (
-            'DRIVE_BASE / "nile_lowrank_official_demo_quick"',
+            '"nile_lowrank_official_demo_" + profile_suffix',
             'INPUT_DIR = DRIVE_PROJECT_ROOT / "inputs"',
-            "3 official images x 1 seed x 5 methods = 15 runs",
-            "not a formal FULL result",
+            "PILOT: 1 input x 2 seeds x 18 configurations = 36 runs",
+            "FULL: 2 inputs x 3 seeds x 5 methods = 30 runs",
+            "complete pipeline run on curated demos, not a formal-scale dataset",
         ):
             self.assertIn(literal, configuration)
         for filename in (
@@ -69,23 +72,32 @@ class NileLowrankNotebookContractTests(unittest.TestCase):
         ):
             self.assertIn(filename, clone_and_inputs)
         for literal in (
-            '"pilot_count": 3',
-            '"full_count": 0',
+            '"pilot_count": 1',
+            '"full_count": 2',
             '"min_distinct_inputs": 3',
-            '"seeds": [0]',
-            '"ranks": [8]',
-            '"target_kls": [1.0]',
-            '"rbf_length_scales_deg": [45.0]',
-            '"expected_configs_per_input_seed": 5',
-            'resolved_config["runtime"]["min_free_disk_gib"] = 10.0',
+            '"seeds": [0, 1]',
+            '"ranks": [8, 16]',
+            '"target_kls": [1.0, 5.0]',
+            '"rbf_length_scales_deg": [45.0, 90.0]',
+            '"expected_configs_per_input_seed": 18',
+            'resolved_config["full"]["seeds"] = [0, 1, 2]',
+            '"input_count": 2',
         ):
             self.assertIn(literal, freeze)
         self.assertIn(
             'run_stage("select", enabled=FULL_MODE and RUN_MET3R)',
             self.sources[11],
         )
-        self.assertIn("Official demo quick results:", display)
-        self.assertIn("FULL remains incomplete", display)
+        for cell_index, stage_call in (
+            (10, 'run_stage("evaluate", enabled=RUN_MET3R)'),
+            (13, 'run_stage("full", enabled=FULL_MODE)'),
+            (14, 'run_stage("trajectory", enabled=FULL_MODE)'),
+            (15, 'run_stage("evaluate", enabled=RUN_MET3R)'),
+        ):
+            self.assertIn(stage_call, self.sources[cell_index])
+        self.assertIn("Official demo", display)
+        self.assertIn('"contact_sheets"', display)
+        self.assertIn('(("pilot", 2), ("full", 6))', display)
 
     def test_actual_hashed_runner_root_is_used_for_every_artifact(self):
         freeze_cell = self.sources[5]
@@ -142,9 +154,23 @@ class NileLowrankNotebookContractTests(unittest.TestCase):
         self.assertIn("GITHUB_REPO", source)
         self.assertIn("GIT_BRANCH", source)
         self.assertIn("then restart Run All", source)
+        self.assertIn(
+            "def install_timm_layers_compatibility", source
+        )
+        self.assertIn(
+            "predates the timm/BiRefNet compatibility fix", source
+        )
 
     def test_dependencies_and_all_immutable_weight_revisions(self):
         self.assertIn("requirements-colab.txt", self.joined)
+        self.assertIn(
+            "install_timm_layers_compatibility", self.sources[3]
+        )
+        self.assertIn(
+            "from timm.layers import DropPath, to_2tuple, trunc_normal_",
+            self.sources[3],
+        )
+        self.assertIn("timm/BiRefNet import smoke test:", self.sources[3])
         self.assertIn(
             "git+https://github.com/mohammadasim98/met3r@", self.joined
         )

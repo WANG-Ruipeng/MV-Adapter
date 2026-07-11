@@ -1,14 +1,18 @@
 import hashlib
 import json
+import sys
 import tempfile
 import unittest
 from pathlib import Path
+from types import ModuleType, SimpleNamespace
+from unittest.mock import patch
 
 from scripts.nile_lowrank_inference_worker import (
     JsonlEventWriter,
     PersistentInferenceWorker,
     audit_artifact_bundle,
     build_parser,
+    install_timm_layers_compatibility,
     load_worker_plan,
     main,
 )
@@ -217,6 +221,49 @@ def _events(path):
 
 
 class PersistentWorkerContractTests(unittest.TestCase):
+    def test_legacy_timm_layers_are_aliased_for_birefnet(self):
+        missing = ModuleNotFoundError("No module named 'timm.layers'")
+        missing.name = "timm.layers"
+        legacy_layers = ModuleType("timm.models.layers")
+        legacy_layers.DropPath = object()
+        legacy_layers.to_2tuple = object()
+        legacy_layers.trunc_normal_ = object()
+        timm_module = SimpleNamespace()
+
+        def fake_import(name):
+            if name == "timm.layers":
+                raise missing
+            if name == "timm.models.layers":
+                return legacy_layers
+            if name == "timm":
+                return timm_module
+            raise AssertionError("unexpected import: " + name)
+
+        previous = sys.modules.pop("timm.layers", None)
+        try:
+            with patch(
+                "scripts.nile_lowrank_inference_worker.importlib.import_module",
+                side_effect=fake_import,
+            ):
+                mode = install_timm_layers_compatibility()
+            self.assertEqual(mode, "legacy_timm.models.layers_alias")
+            self.assertIs(sys.modules["timm.layers"], legacy_layers)
+            self.assertIs(timm_module.layers, legacy_layers)
+            imported = {}
+            exec(
+                "from timm.layers import DropPath, to_2tuple, trunc_normal_",
+                imported,
+            )
+            self.assertIs(imported["DropPath"], legacy_layers.DropPath)
+            self.assertIs(imported["to_2tuple"], legacy_layers.to_2tuple)
+            self.assertIs(
+                imported["trunc_normal_"], legacy_layers.trunc_normal_
+            )
+        finally:
+            sys.modules.pop("timm.layers", None)
+            if previous is not None:
+                sys.modules["timm.layers"] = previous
+
     def test_two_runs_reuse_pipeline_and_segmentation_once(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
