@@ -24,6 +24,13 @@ DEFAULT_DISTRIBUTION_THRESHOLDS = {
     "max_cross_view_covariance_mae": 0.03,
 }
 
+DEFAULT_LOWRANK_GATE_THRESHOLDS = {
+    "max_basis_orthonormality_error": 1e-6,
+    "max_basis_coefficient_covariance_mae": 0.03,
+    "max_joint_kl_relative_error": 1e-5,
+    "min_covariance_eigenvalue": 1e-8,
+}
+
 
 def _validate_latents(latents: torch.Tensor) -> torch.Tensor:
     if not isinstance(latents, torch.Tensor):
@@ -492,6 +499,228 @@ def empirical_cross_view_covariance(
     return flattened.matmul(flattened.mT) / float(flattened.shape[1])
 
 
+def empirical_view_covariance(samples: torch.Tensor) -> torch.Tensor:
+    """Estimate a population covariance from ``[observations, views]``.
+
+    This helper is shared by spatial projections and supplemental IID
+    coefficient ensembles.  It only subtracts the ensemble mean; it never
+    standardises an observation or repairs its variance.
+    """
+
+    if not isinstance(samples, torch.Tensor):
+        raise TypeError("samples must be a torch.Tensor")
+    if samples.ndim != 2 or samples.shape[0] < 2 or samples.shape[1] < 1:
+        raise ValueError("samples must have shape [observations>=2, views>=1]")
+    if not samples.is_floating_point():
+        raise TypeError("samples must have a floating-point dtype")
+    if not bool(torch.isfinite(samples).all()):
+        raise ValueError("samples must contain only finite values")
+    work = samples.detach().to(dtype=torch.float64)
+    centered = work - work.mean(dim=0, keepdim=True)
+    return centered.mT.matmul(centered) / float(centered.shape[0])
+
+
+def project_basis_coefficients(
+    latents: torch.Tensor,
+    basis: torch.Tensor,
+    *,
+    batch_size: int,
+    num_views: int,
+) -> torch.Tensor:
+    """Project latent fields onto an orthonormal basis as ``[B,V,K]``."""
+
+    views = _reshape_views(latents, batch_size, num_views)
+    if not isinstance(basis, torch.Tensor):
+        raise TypeError("basis must be a torch.Tensor")
+    ambient_dimension = int(views.shape[2] * views.shape[3] * views.shape[4])
+    if basis.ndim != 2 or basis.shape[0] != ambient_dimension or basis.shape[1] < 1:
+        raise ValueError(
+            "basis must have shape [{}, K] with K > 0".format(ambient_dimension)
+        )
+    if not basis.is_floating_point() or not bool(torch.isfinite(basis).all()):
+        raise ValueError("basis must be a finite floating-point matrix")
+    basis64 = basis.detach().to(device="cpu", dtype=torch.float64)
+    gram = basis64.mT.matmul(basis64)
+    identity = torch.eye(basis64.shape[1], dtype=torch.float64)
+    error = float((gram - identity).abs().max().item())
+    if error >= 1e-6:
+        raise ValueError(
+            "basis must be orthonormal with max error < 1e-6; got {:.3e}".format(
+                error
+            )
+        )
+    flat = views.reshape(batch_size, num_views, ambient_dimension).to(
+        dtype=torch.float64
+    )
+    return flat.matmul(basis64.to(device=flat.device))
+
+
+def empirical_basis_coefficient_covariance(
+    latents: torch.Tensor,
+    basis: torch.Tensor,
+    *,
+    batch_size: int,
+    num_views: int,
+    additional_samples: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """Estimate cross-view covariance over independent basis coefficients.
+
+    Every ``(batch, basis-column)`` pair is one observation.  Optional
+    ``additional_samples`` must already have shape ``[N,V]`` and is useful for
+    a large, explicitly reported coefficient-space Monte Carlo ensemble.
+    """
+
+    coefficients = project_basis_coefficients(
+        latents,
+        basis,
+        batch_size=batch_size,
+        num_views=num_views,
+    )
+    samples = coefficients.permute(0, 2, 1).reshape(-1, num_views)
+    if additional_samples is not None:
+        if (
+            not isinstance(additional_samples, torch.Tensor)
+            or additional_samples.ndim != 2
+            or additional_samples.shape[1] != num_views
+        ):
+            raise ValueError("additional_samples must have shape [N, num_views]")
+        if not additional_samples.is_floating_point() or not bool(
+            torch.isfinite(additional_samples).all()
+        ):
+            raise ValueError("additional_samples must be finite floating point")
+        samples = torch.cat(
+            (samples, additional_samples.to(device=samples.device, dtype=samples.dtype)),
+            dim=0,
+        )
+    return empirical_view_covariance(samples)
+
+
+def diagnose_lowrank_latents(
+    latents: torch.Tensor,
+    *,
+    batch_size: int,
+    num_views: int,
+    basis: torch.Tensor,
+    coefficient_target_covariance: torch.Tensor,
+    reference_latents: Optional[torch.Tensor] = None,
+    full_space_target_covariance: Optional[torch.Tensor] = None,
+    additional_coefficient_samples: Optional[torch.Tensor] = None,
+    target_kl: Optional[float] = None,
+    achieved_kl: Optional[float] = None,
+    alpha: Optional[float] = None,
+    lags: Sequence[Lag] = ((0, 1), (1, 0), (1, 1)),
+    radial_bins: Optional[int] = None,
+) -> Dict[str, Any]:
+    """Build the ordinary marginal report plus low-rank joint-law checks."""
+
+    if full_space_target_covariance is None:
+        full_space_target_covariance = torch.eye(
+            num_views, dtype=torch.float64, device=latents.device
+        )
+    report = diagnose_latents(
+        latents,
+        batch_size=batch_size,
+        num_views=num_views,
+        reference_latents=reference_latents,
+        target_covariance=full_space_target_covariance,
+        lags=lags,
+        radial_bins=radial_bins,
+    )
+    coefficients = project_basis_coefficients(
+        latents,
+        basis,
+        batch_size=batch_size,
+        num_views=num_views,
+    )
+    spatial_samples = coefficients.permute(0, 2, 1).reshape(-1, num_views)
+    all_samples = spatial_samples
+    supplemental_count = 0
+    if additional_coefficient_samples is not None:
+        if (
+            not isinstance(additional_coefficient_samples, torch.Tensor)
+            or additional_coefficient_samples.ndim != 2
+            or additional_coefficient_samples.shape[1] != num_views
+        ):
+            raise ValueError(
+                "additional_coefficient_samples must have shape [N, num_views]"
+            )
+        if not additional_coefficient_samples.is_floating_point() or not bool(
+            torch.isfinite(additional_coefficient_samples).all()
+        ):
+            raise ValueError(
+                "additional_coefficient_samples must be finite floating point"
+            )
+        supplemental_count = int(additional_coefficient_samples.shape[0])
+        all_samples = torch.cat(
+            (
+                spatial_samples,
+                additional_coefficient_samples.to(
+                    device=spatial_samples.device, dtype=spatial_samples.dtype
+                ),
+            ),
+            dim=0,
+        )
+    empirical = empirical_view_covariance(all_samples)
+    target = coefficient_target_covariance.detach().to(
+        device=empirical.device, dtype=torch.float64
+    )
+    covariance_error = cross_view_covariance_error(empirical, target)
+
+    basis64 = basis.detach().to(device="cpu", dtype=torch.float64)
+    identity = torch.eye(basis64.shape[1], dtype=torch.float64)
+    orthonormality_error = float(
+        (basis64.mT.matmul(basis64) - identity).abs().max().item()
+    )
+    eigenvalues = torch.linalg.eigvalsh(target)
+    minimum_eigenvalue = float(eigenvalues.min().item())
+    maximum_eigenvalue = float(eigenvalues.max().item())
+    condition_number = (
+        maximum_eigenvalue / minimum_eigenvalue
+        if minimum_eigenvalue > 0.0
+        else None
+    )
+    if target_kl is None or achieved_kl is None:
+        kl_relative_error = None
+    elif float(target_kl) == 0.0:
+        kl_relative_error = abs(float(achieved_kl))
+    else:
+        kl_relative_error = abs(float(achieved_kl) - float(target_kl)) / abs(
+            float(target_kl)
+        )
+
+    report["basis"] = {
+        "ambient_dimension": int(basis.shape[0]),
+        "rank": int(basis.shape[1]),
+        "orthonormality_max_error": orthonormality_error,
+    }
+    report["basis_coefficient_covariance"] = {
+        "empirical": [
+            [float(value) for value in row] for row in empirical.cpu().tolist()
+        ],
+        "target": [
+            [float(value) for value in row] for row in target.cpu().tolist()
+        ],
+        "error": covariance_error,
+        "observation_count": int(all_samples.shape[0]),
+        "spatial_projection_observation_count": int(spatial_samples.shape[0]),
+        "supplemental_observation_count": supplemental_count,
+        "per_sample_standardization": False,
+    }
+    report["joint_kl"] = {
+        "target": None if target_kl is None else float(target_kl),
+        "achieved": None if achieved_kl is None else float(achieved_kl),
+        "relative_error": kl_relative_error,
+        "alpha": None if alpha is None else float(alpha),
+    }
+    report["coefficient_covariance_spectrum"] = {
+        "eigenvalues": [float(value) for value in eigenvalues.cpu().tolist()],
+        "min_eigenvalue": minimum_eigenvalue,
+        "max_eigenvalue": maximum_eigenvalue,
+        "condition_number": condition_number,
+    }
+    return report
+
+
 def cross_view_covariance_error(
     empirical: torch.Tensor,
     target: torch.Tensor,
@@ -666,6 +895,14 @@ def evaluate_distribution_gates(
     )
     psd_gate_value = max(psd_value, per_view_psd_value, coarse_psd_value)
     stripe_value = float(report["axis_stripe_score"]["max"])
+    higher_moments = [
+        float(global_stats["skewness"]),
+        float(global_stats["excess_kurtosis"]),
+    ]
+    for stats in per_view_stats:
+        higher_moments.extend(
+            (float(stats["skewness"]), float(stats["excess_kurtosis"]))
+        )
     checks = {
         "mean": {
             "value": mean_value,
@@ -706,6 +943,10 @@ def evaluate_distribution_gates(
             "limit": limits["max_axis_stripe_score"],
             "passed": stripe_value < limits["max_axis_stripe_score"],
         },
+        "finite_higher_moments": {
+            "values": higher_moments,
+            "passed": all(math.isfinite(value) for value in higher_moments),
+        },
     }
     covariance_error = report.get("cross_view_covariance_error")
     if covariance_error is None:
@@ -734,6 +975,132 @@ def evaluate_distribution_gates(
     }
 
 
+def _finite_lowrank_thresholds(
+    overrides: Optional[Mapping[str, float]],
+) -> Dict[str, float]:
+    thresholds = dict(DEFAULT_LOWRANK_GATE_THRESHOLDS)
+    if overrides is not None:
+        unknown = set(overrides) - set(thresholds)
+        if unknown:
+            raise ValueError(
+                "unknown low-rank thresholds: {}".format(sorted(unknown))
+            )
+        thresholds.update({key: float(value) for key, value in overrides.items()})
+    if any(not math.isfinite(value) for value in thresholds.values()):
+        raise ValueError("all low-rank thresholds must be finite")
+    if thresholds["min_covariance_eigenvalue"] < 0.0:
+        raise ValueError("min_covariance_eigenvalue must be non-negative")
+    return thresholds
+
+
+def evaluate_lowrank_distribution_gates(
+    report: Mapping[str, Any],
+    *,
+    distribution_thresholds: Optional[Mapping[str, float]] = None,
+    lowrank_thresholds: Optional[Mapping[str, float]] = None,
+    require_finite_kl: bool = True,
+) -> Dict[str, Any]:
+    """Apply marginal, basis, coefficient-covariance, KL, and eigen gates."""
+
+    base = evaluate_distribution_gates(
+        report,
+        thresholds=distribution_thresholds,
+        require_covariance_target=True,
+    )
+    limits = _finite_lowrank_thresholds(lowrank_thresholds)
+    basis_report = report.get("basis")
+    coefficient_report = report.get("basis_coefficient_covariance")
+    spectrum = report.get("coefficient_covariance_spectrum")
+    joint_kl = report.get("joint_kl")
+    if not isinstance(basis_report, Mapping):
+        raise ValueError("report is missing basis diagnostics")
+    if not isinstance(coefficient_report, Mapping):
+        raise ValueError("report is missing basis coefficient diagnostics")
+    if not isinstance(spectrum, Mapping):
+        raise ValueError("report is missing coefficient covariance spectrum")
+    if not isinstance(joint_kl, Mapping):
+        raise ValueError("report is missing joint KL diagnostics")
+
+    basis_error = float(basis_report["orthonormality_max_error"])
+    covariance_error = coefficient_report.get("error")
+    if not isinstance(covariance_error, Mapping):
+        raise ValueError("basis coefficient report is missing covariance error")
+    covariance_mae = float(
+        covariance_error.get("offdiag_mae", covariance_error["mae"])
+    )
+    minimum_eigenvalue = float(spectrum["min_eigenvalue"])
+    condition_number = spectrum.get("condition_number")
+    kl_relative_error = joint_kl.get("relative_error")
+    kl_evaluated = kl_relative_error is not None
+    kl_passed = (
+        float(kl_relative_error) < limits["max_joint_kl_relative_error"]
+        if kl_evaluated
+        else not require_finite_kl
+    )
+    higher_moments = [
+        float(report["global"]["skewness"]),
+        float(report["global"]["excess_kurtosis"]),
+    ]
+    for item in report.get("per_view", ()):
+        higher_moments.extend(
+            (float(item["skewness"]), float(item["excess_kurtosis"]))
+        )
+
+    checks = dict(base["checks"])
+    checks.update(
+        {
+            "finite_higher_moments": {
+                "values": higher_moments,
+                "passed": all(math.isfinite(value) for value in higher_moments),
+            },
+            "basis_orthonormality": {
+                "value": basis_error,
+                "limit": limits["max_basis_orthonormality_error"],
+                "passed": basis_error < limits["max_basis_orthonormality_error"],
+            },
+            "basis_coefficient_covariance": {
+                "value": covariance_mae,
+                "all_entry_mae": float(covariance_error["mae"]),
+                "offdiag_mae": covariance_mae,
+                "observation_count": int(
+                    coefficient_report.get("observation_count", 0)
+                ),
+                "limit": limits["max_basis_coefficient_covariance_mae"],
+                "passed": covariance_mae
+                < limits["max_basis_coefficient_covariance_mae"],
+            },
+            "joint_kl": {
+                "value": (
+                    None if kl_relative_error is None else float(kl_relative_error)
+                ),
+                "target": joint_kl.get("target"),
+                "achieved": joint_kl.get("achieved"),
+                "alpha": joint_kl.get("alpha"),
+                "limit": limits["max_joint_kl_relative_error"],
+                "evaluated": kl_evaluated,
+                "passed": kl_passed,
+            },
+            "minimum_eigenvalue": {
+                "value": minimum_eigenvalue,
+                "minimum": limits["min_covariance_eigenvalue"],
+                "passed": minimum_eigenvalue
+                > limits["min_covariance_eigenvalue"],
+            },
+            "covariance_condition_number": {
+                "value": condition_number,
+                "passed": condition_number is not None
+                and math.isfinite(float(condition_number))
+                and float(condition_number) >= 1.0,
+            },
+        }
+    )
+    return {
+        "passed": all(bool(check["passed"]) for check in checks.values()),
+        "checks": checks,
+        "thresholds": {**base["thresholds"], **limits},
+    }
+
+
 def assert_distribution_gates(
     report: Mapping[str, Any],
     *,
@@ -757,19 +1124,25 @@ def assert_distribution_gates(
 
 __all__ = [
     "DEFAULT_DISTRIBUTION_THRESHOLDS",
+    "DEFAULT_LOWRANK_GATE_THRESHOLDS",
     "assert_distribution_gates",
     "coarse_radial_psd_deviation",
     "cross_view_covariance_error",
     "cross_view_radial_frequency_correlation",
     "diagnose_latents",
+    "diagnose_lowrank_latents",
+    "empirical_basis_coefficient_covariance",
     "empirical_cross_view_covariance",
+    "empirical_view_covariance",
     "evaluate_distribution_gates",
+    "evaluate_lowrank_distribution_gates",
     "lag_autocorrelations",
     "moment_statistics",
     "per_view_axis_stripe_scores",
     "per_view_lag_autocorrelations",
     "per_view_moment_statistics",
     "per_view_radial_psd_deviation",
+    "project_basis_coefficients",
     "radial_power_spectrum",
     "radial_psd_deviation",
     "spectral_axis_stripe_score",

@@ -1,0 +1,125 @@
+schema_version: 1
+
+experiment:
+  name: nile_lowrank_kl_full
+  output_root: outputs/nile_lowrank_kl_full
+  resume: true
+  run_met3r: true
+  strict_full_requires_met3r: true
+  bootstrap_iterations: 10000
+  bootstrap_seed: 20260711
+
+model:
+  base_model: stabilityai/stable-diffusion-xl-base-1.0
+  base_model_revision: null
+  vae_model: madebyollin/sdxl-vae-fp16-fix
+  vae_model_revision: null
+  adapter_path: huanngzh/mv-adapter
+  adapter_revision: null
+  adapter_sha256: null
+  mv_adapter_checkpoint: mvadapter_i2mv_sdxl.safetensors
+  birefnet_model: ZhengPeng7/BiRefNet
+  birefnet_revision: null
+  scheduler: null
+  num_inference_steps: 30
+  guidance_scale: 3.0
+  height: 768
+  width: 768
+  views_deg: [0, 45, 90, 180, 270, 315]
+  remove_background: true
+  device: cuda
+
+data:
+  input_dir: null
+  drive_input_dir: /content/drive/MyDrive/Colab_Projects/MV-Adapter/nile_lowrank_full_inputs
+  pilot_count: 5
+  full_count: 20
+  min_distinct_inputs: 25
+
+preflight:
+  expected_unattainable_count: 3
+  batch_size: 32
+  channels: 4
+  latent_height: 96
+  latent_width: 96
+  seeds: [0, 1, 2]
+  mean_abs_max: 0.01
+  std_min: 0.99
+  std_max: 1.01
+  lag_abs_max: 0.02
+  radial_psd_max: 0.05
+  axis_stripe_max: 0.15
+  covariance_mae_max: 0.03
+  coefficient_min_observations: 8192
+  basis_orthonormality_max: 0.000001
+  kl_relative_error_max: 0.00001
+  min_eigenvalue: 0.00000001
+
+pilot:
+  seeds: [0, 1]
+  ranks: [8, 16]
+  target_kls: [1.0, 5.0]
+  rbf_length_scales_deg: [45.0, 90.0]
+  methods:
+    - iid_external
+    - shared_full
+    - lowrank_camera_rbf
+    - lowrank_nested_tree_a
+    - lowrank_nested_tree_ab
+  expected_configs_per_input_seed: 18
+
+full:
+  seeds: [0, 1, 2]
+  methods:
+    - iid_external
+    - shared_full
+    - selected_camera_rbf
+    - selected_nested_tree_a
+    - selected_nested_tree_ab
+  allow_sweep: false
+
+trajectory:
+  enabled: true
+  input_count: 2
+  seeds: [0]
+  milestones: [0.0, 0.1, 0.25, 0.5, 0.75, 1.0]
+  washout_max_final_g: 0.5
+  amplified_min_final_g: 1.5
+
+evaluation:
+  met3r_repository: https://github.com/mohammadasim98/met3r
+  met3r_revision: ee0e1752898559e1a3e85e2e151d3edeb9b55f73
+  angle_bins_deg: [45.0, 90.0, 135.0, 180.0]
+  met3r_device: cuda
+  met3r_image_size: 256
+  met3r_batch_size: 1
+  identity_backend: dinov2
+  identity_model: facebook/dinov2-small
+  identity_model_revision: null
+  mask_backend: birefnet
+  save_pair_rows: true
+
+selection:
+  max_dino_drop_abs: 0.02
+  max_small_component_ratio_increase: 0.02
+  max_component_failure_rate_increase: 0.10
+  max_foreground_area_cv_increase: 0.05
+  max_met3r_failure_rate: 0.10
+  rhf_min: 0.5
+  rhf_max: 1.5
+  require_distribution_gate: true
+  one_standard_error_tie_break: true
+  tie_break_order: [target_kl, rank, rbf_stability, rbf_length_scale_deg]
+
+runtime:
+  min_free_disk_gib: 25
+  retry_failed: true
+  max_retries: 1
+  retry_oom_once: true
+  clear_cuda_cache_on_oom: true
+  atomic_manifest: true
+  model_load_strategy: persistent_worker
+
+statement:
+  topology: NILE-inspired nested Gaussian element topology
+  strict_nile_sz_implemented: false

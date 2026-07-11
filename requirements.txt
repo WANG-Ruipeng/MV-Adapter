@@ -3,11 +3,14 @@ diffusers
 transformers
 peft
 numpy
+scipy
+matplotlib
 huggingface_hub
 accelerate
 opencv-python
 safetensors
 pillow
+pyyaml
 omegaconf
 trimesh
 einops

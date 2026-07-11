@@ -77,11 +77,53 @@ class NileInferenceStaticContractTests(unittest.TestCase):
                 "--unet_model_revision",
                 "--lora_model_revision",
                 "--adapter_revision",
+                "--mv_adapter_checkpoint",
                 "--birefnet_model",
                 "--birefnet_revision",
+                "--basis_rank",
+                "--target_joint_kl",
+                "--rbf_length_scale_deg",
+                "--mask_dir",
+                "--save_masks",
+                "--trajectory_output",
+                "--trajectory_milestones",
             }
             <= option_strings
         )
+
+    def test_lowrank_formal_methods_and_equal_kl_construction_are_integrated(self):
+        for method in (
+            "lowrank_camera_rbf",
+            "lowrank_nested_tree_a",
+            "lowrank_nested_tree_ab",
+        ):
+            self.assertIn(f'"{method}"', self.source)
+        self.assertIn("build_dct2_basis(", self.source)
+        self.assertIn("calibrate_alpha_for_target_kl(", self.source)
+        self.assertIn("apply_latent_coupling(", self.source)
+        self.assertIn('calibration["status"] != "calibrated"', self.source)
+        self.assertIn('"alpha_zero_exact_iid_passthrough"', self.source)
+
+    def test_lowrank_metadata_and_foreground_masks_are_persisted(self):
+        for field in (
+            "basis_rank",
+            "target_joint_kl",
+            "achieved_kl",
+            "alpha",
+            "basis_checksum",
+            "covariance_checksum",
+            "rbf_length_scale_deg",
+        ):
+            self.assertIn(f'"{field}"', self.source)
+        self.assertIn('"mask_files": mask_files', self.source)
+        self.assertIn('metadata["foreground_masks"]', self.source)
+
+    def test_trajectory_observer_is_registered_as_read_only(self):
+        self.assertIn("observer = TrajectoryObserver(", self.source)
+        self.assertIn(
+            'pipeline_kwargs["callback_on_step_end"] = observer', self.source
+        )
+        self.assertIn('"read_only": True', self.source)
 
     def test_model_revisions_reach_loaders_and_metadata(self):
         expected_loader_assignments = {
@@ -108,6 +150,34 @@ class NileInferenceStaticContractTests(unittest.TestCase):
             'birefnet_kwargs["revision"] = args.birefnet_revision',
             self.source,
         )
+
+    def test_checkpoint_scheduler_and_atomic_metadata_contracts(self):
+        self.assertIn(
+            'adapter_kwargs = {"weight_name": mv_adapter_checkpoint}',
+            self.source,
+        )
+        self.assertIn(
+            'scheduler not in (None, "ddpm", "lcm")',
+            self.source,
+        )
+        self.assertIn(
+            'parser.add_argument("--scheduler", choices=("ddpm", "lcm")',
+            self.source,
+        )
+        self.assertIn(
+            "metadata_temporary = metadata_path.with_name", self.source
+        )
+        self.assertIn("os.replace(metadata_temporary, metadata_path)", self.source)
+        self.assertIn("birefnet.eval()", self.source)
+
+    def test_trajectory_milestones_are_validated_and_passed_to_observer(self):
+        for literal in (
+            "trajectory_milestones must start at 0.0",
+            "trajectory_milestones must end at 1.0",
+            "milestones=trajectory_milestones",
+            '"milestones": (',
+        ):
+            self.assertIn(literal, self.source)
 
     def test_required_preflight_runs_before_model_loading(self):
         main = next(
@@ -173,6 +243,26 @@ class NileInferenceStaticContractTests(unittest.TestCase):
         self.assertIn(
             "scheduler_generator if scheduler_generator is not None else generator",
             pipeline_source,
+        )
+
+    def test_observer_records_initial_state_after_prepare_latents(self):
+        pipeline_source = (
+            REPO_ROOT
+            / "mvadapter"
+            / "pipelines"
+            / "pipeline_mvadapter_i2mv_sdxl.py"
+        ).read_text(encoding="utf-8")
+        prepare_position = pipeline_source.index("latents = self.prepare_latents(")
+        record_position = pipeline_source.index(
+            "callback_on_step_end.record_initial("
+        )
+        scheduler_position = pipeline_source.index(
+            "extra_step_kwargs = self.prepare_extra_step_kwargs("
+        )
+        self.assertLess(prepare_position, record_position)
+        self.assertLess(record_position, scheduler_position)
+        self.assertNotIn(
+            "latents = callback_on_step_end.record_initial(", pipeline_source
         )
 
 

@@ -7,9 +7,14 @@ peft
 huggingface_hub
 accelerate
 numpy
+scipy
+matplotlib
+pandas
+pytest
 opencv-python-headless
 safetensors
 pillow
+pyyaml
 omegaconf
 trimesh
 einops

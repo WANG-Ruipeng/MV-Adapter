@@ -6,8 +6,10 @@ projection prototypes remain available solely for legacy failure analysis.
 """
 
 import argparse
+import hashlib
 import json
 import math
+import os
 from pathlib import Path
 
 import numpy as np
@@ -18,11 +20,24 @@ from torchvision import transforms
 from transformers import AutoModelForImageSegmentation
 
 from mvadapter.nile.callbacks import NILECallbackConfig, NILEViewTimeCallback
+from mvadapter.nile.basis import build_dct2_basis
+from mvadapter.nile.covariance import (
+    calibrate_alpha_for_target_kl,
+    covariance_metadata,
+    periodic_camera_rbf_covariance,
+    tree_a_covariance,
+    tree_ab_covariance,
+)
+from mvadapter.nile.lowrank_coupling import apply_latent_coupling
 from mvadapter.nile.nested_elements import make_nested_tree_latents
 from mvadapter.nile.sampler import NILEConfig, make_initial_latents
 from mvadapter.nile.spectral_gaussian import (
     make_camera_rbf_correlated_latents,
     make_spectral_global_correlated_latents,
+)
+from mvadapter.nile.trajectory import (
+    DEFAULT_TRAJECTORY_MILESTONES,
+    TrajectoryObserver,
 )
 from mvadapter.pipelines.pipeline_mvadapter_i2mv_sdxl import (
     MVAdapterI2MVSDXLPipeline,
@@ -50,6 +65,14 @@ FORMAL_METHODS = (
     "camera_rbf_corr",
     "nested_tree_a",
     "nested_tree_ab",
+    "lowrank_camera_rbf",
+    "lowrank_nested_tree_a",
+    "lowrank_nested_tree_ab",
+)
+LOWRANK_METHODS = (
+    "lowrank_camera_rbf",
+    "lowrank_nested_tree_a",
+    "lowrank_nested_tree_ab",
 )
 LEGACY_NILE_MODES = (
     "iid",
@@ -73,6 +96,7 @@ def prepare_pipeline(
     unet_model,
     lora_model,
     adapter_path,
+    mv_adapter_checkpoint,
     scheduler,
     num_views,
     device,
@@ -83,6 +107,15 @@ def prepare_pipeline(
     lora_model_revision=None,
     adapter_revision=None,
 ):
+    if scheduler not in (None, "ddpm", "lcm"):
+        raise ValueError(
+            "scheduler must be one of None, 'ddpm', or 'lcm'; got {!r}".format(
+                scheduler
+            )
+        )
+    if not isinstance(mv_adapter_checkpoint, str) or not mv_adapter_checkpoint.strip():
+        raise ValueError("mv_adapter_checkpoint must be a non-empty filename")
+
     # Load VAE and U-Net overrides if provided.
     pipe_kwargs = {}
     if vae_model is not None:
@@ -116,7 +149,7 @@ def prepare_pipeline(
         scheduler_class=scheduler_class,
     )
     pipe.init_custom_adapter(num_views=num_views)
-    adapter_kwargs = {"weight_name": "mvadapter_i2mv_sdxl.safetensors"}
+    adapter_kwargs = {"weight_name": mv_adapter_checkpoint}
     if adapter_revision is not None:
         adapter_kwargs["revision"] = adapter_revision
     pipe.load_custom_adapter(adapter_path, **adapter_kwargs)
@@ -216,6 +249,178 @@ def _preflight_output_path(output: str) -> Path:
     return output_path.with_name(f"{output_path.stem}_preflight.json")
 
 
+def _covariance_checksum(covariance: torch.Tensor) -> str:
+    """Hash the exact float64 covariance used for one inference run."""
+
+    canonical = covariance.detach().to(device="cpu", dtype=torch.float64).contiguous()
+    header = (
+        "nile-view-covariance-v1|{}|{}|".format(
+            canonical.shape[0], canonical.shape[1]
+        )
+    ).encode("ascii")
+    raw = bytes(canonical.view(torch.uint8).reshape(-1).tolist())
+    return hashlib.sha256(header + raw).hexdigest()
+
+
+def _lowrank_target_covariance(method, azimuth_deg, rbf_length_scale_deg):
+    if method == "lowrank_camera_rbf":
+        return periodic_camera_rbf_covariance(
+            azimuth_deg,
+            ell_deg=rbf_length_scale_deg,
+            dtype=torch.float64,
+        )
+    if method == "lowrank_nested_tree_a":
+        return tree_a_covariance(azimuth_deg, dtype=torch.float64)
+    if method == "lowrank_nested_tree_ab":
+        return tree_ab_covariance(azimuth_deg, dtype=torch.float64)
+    raise ValueError(f"unsupported low-rank method: {method}")
+
+
+def _prepare_lowrank_components(
+    *,
+    method,
+    azimuth_deg,
+    channels,
+    latent_h,
+    latent_w,
+    basis_rank,
+    target_joint_kl,
+    rbf_length_scale_deg,
+    basis_device="cpu",
+):
+    """Build and calibrate a low-rank coupling without touching model state."""
+
+    basis, basis_info = build_dct2_basis(
+        channels,
+        latent_h,
+        latent_w,
+        basis_rank,
+        device=basis_device,
+        dtype=torch.float32,
+        return_metadata=True,
+    )
+    target = _lowrank_target_covariance(
+        method, azimuth_deg, rbf_length_scale_deg
+    )
+    calibration = calibrate_alpha_for_target_kl(
+        target,
+        basis_rank,
+        target_joint_kl,
+    )
+    topology = {
+        "lowrank_camera_rbf": "periodic_camera_rbf",
+        "lowrank_nested_tree_a": "nested_tree_a",
+        "lowrank_nested_tree_ab": "nested_tree_ab",
+    }[method]
+    target_info = covariance_metadata(
+        target,
+        azimuths_deg=azimuth_deg,
+        ell_deg=(
+            rbf_length_scale_deg if method == "lowrank_camera_rbf" else None
+        ),
+        topology=topology,
+    )
+    effective = calibration["covariance"]
+    effective_info = covariance_metadata(
+        effective,
+        azimuths_deg=azimuth_deg,
+        topology="identity_mixed_{}".format(topology),
+    )
+    metadata = {
+        "method": method,
+        "basis_rank": int(basis_rank),
+        "target_joint_kl": float(target_joint_kl),
+        "achieved_kl": float(calibration["achieved_kl"]),
+        "kl_relative_error": float(calibration["relative_error"]),
+        "alpha": float(calibration["alpha"]),
+        "calibration_status": calibration["status"],
+        "rbf_length_scale_deg": (
+            float(rbf_length_scale_deg)
+            if method == "lowrank_camera_rbf"
+            else None
+        ),
+        "basis_checksum": basis_info["basis_checksum"],
+        "target_covariance_checksum": _covariance_checksum(target),
+        "covariance_checksum": _covariance_checksum(effective),
+        "basis": basis_info,
+        "target_covariance": target_info,
+        "effective_covariance": effective_info,
+        "calibration": calibration["json_metadata"],
+        "topology_statement": "NILE-inspired nested Gaussian element topology",
+        "strict_nile_sz_implemented": False,
+    }
+    return basis, target, calibration, metadata
+
+
+def _run_lowrank_preflight(args, report_path: Path):
+    """Fail fast on an invalid or unattainable low-rank CLI configuration."""
+
+    _, _, calibration, construction = _prepare_lowrank_components(
+        method=args.resolved_method,
+        azimuth_deg=args.azimuth_deg,
+        channels=PREFLIGHT_CHANNELS,
+        latent_h=PREFLIGHT_HEIGHT,
+        latent_w=PREFLIGHT_WIDTH,
+        basis_rank=args.basis_rank,
+        target_joint_kl=args.target_joint_kl,
+        rbf_length_scale_deg=args.rbf_length_scale_deg,
+    )
+    checks = {
+        "calibration_attainable": calibration["status"] == "calibrated",
+        "kl_relative_error": calibration["relative_error"] < 1e-5,
+        "basis_orthonormality": (
+            construction["basis"]["output_orthonormality_error"] < 1e-6
+        ),
+        "effective_covariance_positive_definite": (
+            construction["effective_covariance"]["min_eigenvalue"] > 0.0
+        ),
+    }
+    passed = all(checks.values())
+    payload = {
+        "schema_version": "nile_lowrank_cli_preflight_v1",
+        "passed": passed,
+        "config": {
+            "method": args.resolved_method,
+            "azimuth_deg": list(args.azimuth_deg),
+            "basis_rank": args.basis_rank,
+            "target_joint_kl": args.target_joint_kl,
+            "rbf_length_scale_deg": args.rbf_length_scale_deg,
+        },
+        "checks": checks,
+        "construction": construction,
+        "scope": (
+            "deterministic construction gate; ensemble distribution gates are "
+            "recorded by scripts.diagnose_nile_lowrank for formal studies"
+        ),
+    }
+    report_path.parent.mkdir(parents=True, exist_ok=True)
+    with report_path.open("w", encoding="utf-8") as handle:
+        json.dump(payload, handle, indent=2, ensure_ascii=False)
+        handle.write("\n")
+    if not passed:
+        failed = ", ".join(name for name, value in checks.items() if not value)
+        raise RuntimeError(
+            "formal low-rank preflight failed for {}: {} (requested KL {}, "
+            "maximum/calibrated KL {}). Report: {}".format(
+                args.resolved_method,
+                failed,
+                args.target_joint_kl,
+                calibration["achieved_kl"],
+                report_path,
+            )
+        )
+    print(f"Preflight: {report_path}")
+    return {
+        "applicable": True,
+        "passed": True,
+        "report": str(report_path.resolve()),
+        "schema_version": payload["schema_version"],
+        "config": payload["config"],
+        "checks": checks,
+        "construction": construction,
+    }
+
+
 def _preflight_summary(payload, report_path: Path):
     """Keep generation metadata compact while retaining the full sidecar report."""
 
@@ -262,6 +467,8 @@ def _run_required_preflight(args):
         }
 
     report_path = _preflight_output_path(args.output)
+    if args.resolved_method in LOWRANK_METHODS:
+        return _run_lowrank_preflight(args, report_path)
     payload = run_preflight(
         args.resolved_method,
         view_angles=args.azimuth_deg,
@@ -295,6 +502,26 @@ def _run_required_preflight(args):
     return summary
 
 
+def _validated_trajectory_milestones(values):
+    milestones = tuple(float(value) for value in values)
+    if not milestones:
+        raise ValueError("trajectory_milestones must not be empty")
+    if any(
+        not math.isfinite(value) or value < 0.0 or value > 1.0
+        for value in milestones
+    ):
+        raise ValueError("trajectory_milestones must be finite values in [0, 1]")
+    if tuple(sorted(set(milestones))) != milestones:
+        raise ValueError(
+            "trajectory_milestones must be strictly increasing and unique"
+        )
+    if not math.isclose(milestones[0], 0.0, abs_tol=1e-12):
+        raise ValueError("trajectory_milestones must start at 0.0")
+    if not math.isclose(milestones[-1], 1.0, abs_tol=1e-12):
+        raise ValueError("trajectory_milestones must end at 1.0")
+    return milestones
+
+
 def _validate_nile_configuration(
     *,
     num_views,
@@ -317,6 +544,11 @@ def _validate_nile_configuration(
     max_correlation,
     frequency_scale,
     camera_length_scale,
+    basis_rank,
+    target_joint_kl,
+    rbf_length_scale_deg,
+    trajectory_output,
+    trajectory_milestones,
 ):
     if num_views <= 0:
         raise ValueError("num_views must be positive")
@@ -334,6 +566,10 @@ def _validate_nile_configuration(
     if method in FORMAL_METHODS and nile_callback != "none":
         raise ValueError(
             "formal distribution-preserving methods prohibit legacy latent callbacks"
+        )
+    if trajectory_output is not None and nile_callback != "none":
+        raise ValueError(
+            "trajectory observation cannot be combined with a latent-mutating callback"
         )
     if method in FORMAL_METHODS:
         valid_correlation = (
@@ -371,6 +607,28 @@ def _validate_nile_configuration(
 
     latent_h = height // vae_scale_factor
     latent_w = width // vae_scale_factor
+    if isinstance(basis_rank, bool) or not isinstance(basis_rank, int):
+        raise ValueError("basis_rank must be a positive integer")
+    maximum_basis_rank = 4 * (latent_h * latent_w - 1)
+    if basis_rank <= 0 or basis_rank > maximum_basis_rank:
+        raise ValueError(
+            f"basis_rank must be in [1, {maximum_basis_rank}], got {basis_rank}"
+        )
+    if trajectory_output is not None and basis_rank < 2:
+        raise ValueError("trajectory observation requires basis_rank >= 2")
+    _validated_trajectory_milestones(trajectory_milestones)
+    if not math.isfinite(target_joint_kl) or target_joint_kl < 0.0:
+        raise ValueError(
+            f"target_joint_kl must be finite and non-negative, got {target_joint_kl}"
+        )
+    if (
+        not math.isfinite(rbf_length_scale_deg)
+        or rbf_length_scale_deg <= 0.0
+    ):
+        raise ValueError(
+            "rbf_length_scale_deg must be finite and positive, got "
+            f"{rbf_length_scale_deg}"
+        )
     for name, kernel in (
         ("blur_kernel", blur_kernel),
         ("callback_blur_kernel", callback_blur_kernel),
@@ -432,6 +690,12 @@ def run_pipeline(
     max_correlation=0.45,
     frequency_scale=0.12,
     camera_length_scale=0.8,
+    basis_rank=8,
+    target_joint_kl=1.0,
+    rbf_length_scale_deg=90.0,
+    trajectory_output=None,
+    trajectory_milestones=DEFAULT_TRAJECTORY_MILESTONES,
+    return_run_metadata=False,
 ):
     if azimuth_deg is None:
         azimuth_deg = [0, 45, 90, 180, 270, 315]
@@ -443,6 +707,9 @@ def run_pipeline(
         raise ValueError("num_inference_steps must be positive")
 
     selected_method = _resolve_method(method, nile_mode)
+    trajectory_milestones = _validated_trajectory_milestones(
+        trajectory_milestones
+    )
     vae_scale_factor = int(pipe.vae_scale_factor)
     _validate_nile_configuration(
         num_views=num_views,
@@ -465,6 +732,11 @@ def run_pipeline(
         max_correlation=max_correlation,
         frequency_scale=frequency_scale,
         camera_length_scale=camera_length_scale,
+        basis_rank=basis_rank,
+        target_joint_kl=target_joint_kl,
+        rbf_length_scale_deg=rbf_length_scale_deg,
+        trajectory_output=trajectory_output,
+        trajectory_milestones=trajectory_milestones,
     )
 
     # Prepare cameras and per-view Plucker controls exactly as in the original
@@ -511,27 +783,105 @@ def run_pipeline(
     )
 
     latents = None
+    trajectory_basis = None
+    construction_metadata = {
+        "method": selected_method,
+        "basis_rank": None,
+        "target_joint_kl": None,
+        "achieved_kl": None,
+        "alpha": None,
+        "basis_checksum": None,
+        "covariance_checksum": None,
+        "per_sample_standardization": False,
+    }
     if selected_method == "iid_default":
         # Deliberately omit external latents. The pipeline consumes exactly the
         # same latent_generator stream that iid_external consumes below.
-        pass
+        construction_metadata.update(
+            {
+                "identity_passthrough": True,
+                "external_latents": False,
+                "interpretation": "pipeline_native_iid_control",
+            }
+        )
     elif selected_method == "iid_external":
-        latents = torch.randn(
+        iid_latents = torch.randn(
             expected_shape,
             generator=latent_generator,
             device=execution_device,
             dtype=latent_dtype,
         )
+        latents, coupling_info = apply_latent_coupling(
+            iid_latents,
+            "iid_external",
+            num_views,
+            return_metadata=True,
+        )
+        construction_metadata.update(coupling_info)
     elif selected_method == "shared_full":
-        shared = torch.randn(
-            (batch_size, channels, latent_h, latent_w),
+        # Draw the same canonical full IID tensor as iid_external. Coupling
+        # then reuses its first view, so all methods consume an identical
+        # initial-noise stream even though this diagnostic is degenerate.
+        iid_latents = torch.randn(
+            expected_shape,
             generator=latent_generator,
             device=execution_device,
             dtype=latent_dtype,
         )
-        latents = shared[:, None].expand(
-            batch_size, num_views, channels, latent_h, latent_w
-        ).reshape(expected_shape)
+        latents, coupling_info = apply_latent_coupling(
+            iid_latents,
+            "shared_full",
+            num_views,
+            return_metadata=True,
+        )
+        construction_metadata.update(coupling_info)
+    elif selected_method in LOWRANK_METHODS:
+        iid_latents = torch.randn(
+            expected_shape,
+            generator=latent_generator,
+            device=execution_device,
+            dtype=latent_dtype,
+        )
+        basis, target_covariance, calibration, lowrank_info = (
+            _prepare_lowrank_components(
+                method=selected_method,
+                azimuth_deg=azimuth_deg,
+                channels=channels,
+                latent_h=latent_h,
+                latent_w=latent_w,
+                basis_rank=basis_rank,
+                target_joint_kl=target_joint_kl,
+                rbf_length_scale_deg=rbf_length_scale_deg,
+                basis_device=execution_device,
+            )
+        )
+        if calibration["status"] != "calibrated":
+            raise RuntimeError(
+                "target joint KL {} is unattainable for method={} rank={}; "
+                "maximum calibrated KL is {}".format(
+                    target_joint_kl,
+                    selected_method,
+                    basis_rank,
+                    calibration["achieved_kl"],
+                )
+            )
+        latents, coupling_info = apply_latent_coupling(
+            iid_latents,
+            selected_method,
+            num_views,
+            basis=basis,
+            view_covariance=target_covariance,
+            alpha=calibration["alpha"],
+            return_metadata=True,
+        )
+        lowrank_info["coupling"] = coupling_info
+        lowrank_info["alpha_zero_exact_iid_passthrough"] = bool(
+            calibration["alpha"] == 0.0
+            and latents is iid_latents
+            and latents.data_ptr() == iid_latents.data_ptr()
+        )
+        construction_metadata = lowrank_info
+        trajectory_basis = basis
     elif selected_method == "spectral_global_corr":
         latents = make_spectral_global_correlated_latents(
             batch_size,
@@ -625,7 +975,31 @@ def run_pipeline(
     if latents is not None:
         pipeline_kwargs["latents"] = latents
 
-    if nile_callback != "none":
+    observer = None
+    if trajectory_output is not None:
+        if trajectory_basis is None:
+            trajectory_basis, trajectory_basis_info = build_dct2_basis(
+                channels,
+                latent_h,
+                latent_w,
+                basis_rank,
+                device=execution_device,
+                dtype=torch.float32,
+                return_metadata=True,
+            )
+            construction_metadata["trajectory_basis_checksum"] = (
+                trajectory_basis_info["basis_checksum"]
+            )
+        observer = TrajectoryObserver(
+            trajectory_basis,
+            num_views=num_views,
+            batch_size=batch_size,
+            total_steps=num_inference_steps,
+            milestones=trajectory_milestones,
+        )
+        pipeline_kwargs["callback_on_step_end"] = observer
+        pipeline_kwargs["callback_on_step_end_tensor_inputs"] = observer.tensor_inputs
+    elif nile_callback != "none":
         callback_cfg = NILECallbackConfig(
             mode=nile_callback,
             num_views=num_views,
@@ -643,10 +1017,31 @@ def run_pipeline(
         pipeline_kwargs["callback_on_step_end_tensor_inputs"] = ["latents"]
 
     images = pipe(**pipeline_kwargs).images
+    trajectory_files = None
+    if observer is not None:
+        saved = observer.save(trajectory_output)
+        trajectory_files = {
+            name: str(path.resolve()) if path is not None else None
+            for name, path in saved.items()
+        }
+    run_metadata = {
+        "distribution": construction_metadata,
+        "trajectory": {
+            "enabled": observer is not None,
+            "read_only": True,
+            "recorded_after_prepare_latents": observer is not None,
+            "milestones": (
+                list(trajectory_milestones) if observer is not None else None
+            ),
+            "files": trajectory_files,
+        },
+    }
+    if return_run_metadata:
+        return images, reference_image, run_metadata
     return images, reference_image
 
 
-def _save_outputs(images, reference_image, args):
+def _save_outputs(images, reference_image, args, mask_fn=None):
     if len(images) != len(args.azimuth_deg):
         raise ValueError(
             f"pipeline returned {len(images)} images for "
@@ -676,12 +1071,53 @@ def _save_outputs(images, reference_image, args):
             view_image.save(view_path)
             view_files.append(str(view_path.resolve()))
 
+    mask_files = []
+    mask_dir = None
+    if getattr(args, "save_masks", False):
+        if mask_fn is None:
+            raise RuntimeError(
+                "--save_masks requires the configured foreground segmentation model"
+            )
+        mask_dir = (
+            Path(args.mask_dir).expanduser()
+            if args.mask_dir is not None
+            else output_path.with_name(f"{output_path.stem}_masks")
+        )
+        mask_dir.mkdir(parents=True, exist_ok=True)
+        for index, (view_image, azimuth) in enumerate(zip(images, args.azimuth_deg)):
+            mask = mask_fn(view_image.copy())
+            if mask.mode != "L":
+                mask = mask.convert("L")
+            mask_path = mask_dir / f"view_{index:03d}_azimuth_{azimuth:+04d}.png"
+            mask.save(mask_path)
+            mask_files.append(str(mask_path.resolve()))
+
+    input_path = Path(args.image).expanduser().resolve()
+    input_hasher = hashlib.sha256()
+    with input_path.open("rb") as input_handle:
+        for chunk in iter(lambda: input_handle.read(1024 * 1024), b""):
+            input_hasher.update(chunk)
+    actual_input_sha256 = input_hasher.hexdigest()
+    declared_input_sha256 = getattr(args, "input_sha256", None)
+    if (
+        declared_input_sha256 is not None
+        and str(declared_input_sha256).lower() != actual_input_sha256
+    ):
+        raise ValueError(
+            "input_sha256 does not match the current input file: {}".format(
+                input_path
+            )
+        )
+
     metadata_path = output_path.with_name(f"{output_path.stem}_metadata.json")
     metadata = {
+        "config_id": getattr(args, "config_id", None),
         "output": str(output_path.resolve()),
         "reference_output": str(reference_path.resolve()),
         "views_dir": str(views_dir.resolve()) if views_dir is not None else None,
         "view_files": view_files,
+        "mask_dir": str(mask_dir.resolve()) if mask_dir is not None else None,
+        "mask_files": mask_files,
         "azimuth_deg": list(args.azimuth_deg),
         "num_views": len(args.azimuth_deg),
         "seed": args.seed,
@@ -691,6 +1127,9 @@ def _save_outputs(images, reference_image, args):
         "max_correlation": args.max_correlation,
         "frequency_scale": args.frequency_scale,
         "camera_length_scale": args.camera_length_scale,
+        "basis_rank": args.basis_rank,
+        "target_joint_kl": args.target_joint_kl,
+        "rbf_length_scale_deg": args.rbf_length_scale_deg,
         "mode": args.resolved_method,
         "callback": args.nile_callback,
         "rho_geo": args.rho_geo,
@@ -702,7 +1141,8 @@ def _save_outputs(images, reference_image, args):
             {"applicable": False, "passed": None, "reason": "not_recorded"},
         ),
         "input": {
-            "image": str(Path(args.image).expanduser().resolve()),
+            "image": str(input_path),
+            "sha256": actual_input_sha256,
             "text": args.text,
         },
         "models": {
@@ -716,6 +1156,7 @@ def _save_outputs(images, reference_image, args):
             "lora_model_revision": args.lora_model_revision,
             "adapter_path": args.adapter_path,
             "adapter_revision": args.adapter_revision,
+            "mv_adapter_checkpoint": args.mv_adapter_checkpoint,
             "birefnet_model": args.birefnet_model,
             "birefnet_revision": args.birefnet_revision,
             "scheduler": args.scheduler,
@@ -736,6 +1177,9 @@ def _save_outputs(images, reference_image, args):
             "max_correlation": args.max_correlation,
             "frequency_scale": args.frequency_scale,
             "camera_length_scale": args.camera_length_scale,
+            "basis_rank": args.basis_rank,
+            "target_joint_kl": args.target_joint_kl,
+            "rbf_length_scale_deg": args.rbf_length_scale_deg,
             "latent_generator_seed": _effective_seed(args.seed),
             "reference_generator_seed": _reference_vae_seed(args.seed),
             "reference_generator_is_independent": True,
@@ -786,9 +1230,31 @@ def _save_outputs(images, reference_image, args):
             ),
         },
     }
-    with metadata_path.open("w", encoding="utf-8") as handle:
+    run_metadata = getattr(args, "run_metadata", {})
+    metadata["distribution"].update(run_metadata.get("distribution", {}))
+    metadata["trajectory"] = run_metadata.get(
+        "trajectory",
+        {
+            "enabled": False,
+            "read_only": True,
+            "recorded_after_prepare_latents": False,
+            "files": None,
+        },
+    )
+    metadata["foreground_masks"] = {
+        "enabled": bool(getattr(args, "save_masks", False)),
+        "backend": args.birefnet_model if mask_dir is not None else None,
+        "backend_revision": args.birefnet_revision if mask_dir is not None else None,
+        "directory": str(mask_dir.resolve()) if mask_dir is not None else None,
+        "files": mask_files,
+    }
+    metadata_temporary = metadata_path.with_name(metadata_path.name + ".tmp")
+    with metadata_temporary.open("w", encoding="utf-8") as handle:
         json.dump(metadata, handle, indent=2, ensure_ascii=False)
         handle.write("\n")
+        handle.flush()
+        os.fsync(handle.fileno())
+    os.replace(metadata_temporary, metadata_path)
 
     return output_path, reference_path, views_dir, metadata_path
 
@@ -812,11 +1278,16 @@ def _build_parser():
     parser.add_argument("--vae_model_revision", type=str, default=None)
     parser.add_argument("--unet_model", type=str, default=None)
     parser.add_argument("--unet_model_revision", type=str, default=None)
-    parser.add_argument("--scheduler", type=str, default=None)
+    parser.add_argument("--scheduler", choices=("ddpm", "lcm"), default=None)
     parser.add_argument("--lora_model", type=str, default=None)
     parser.add_argument("--lora_model_revision", type=str, default=None)
     parser.add_argument("--adapter_path", type=str, default="huanngzh/mv-adapter")
     parser.add_argument("--adapter_revision", type=str, default=None)
+    parser.add_argument(
+        "--mv_adapter_checkpoint",
+        type=str,
+        default="mvadapter_i2mv_sdxl.safetensors",
+    )
     parser.add_argument("--birefnet_model", type=str, default="ZhengPeng7/BiRefNet")
     parser.add_argument("--birefnet_revision", type=str, default=None)
 
@@ -859,6 +1330,24 @@ def _build_parser():
     parser.add_argument("--max_correlation", type=float, default=0.45)
     parser.add_argument("--frequency_scale", type=float, default=0.12)
     parser.add_argument("--camera_length_scale", type=float, default=0.8)
+    parser.add_argument(
+        "--basis_rank",
+        type=int,
+        default=8,
+        help="Rank of the deterministic orthonormal DCT-II coupling subspace.",
+    )
+    parser.add_argument(
+        "--target_joint_kl",
+        type=float,
+        default=1.0,
+        help="Requested complete joint Gaussian KL from IID, in nats.",
+    )
+    parser.add_argument(
+        "--rbf_length_scale_deg",
+        type=float,
+        default=90.0,
+        help="Periodic camera-RBF length scale in degrees.",
+    )
     parser.add_argument("--rho_geo", type=float, default=0.65)
     parser.add_argument("--blur_kernel", type=int, default=11)
     parser.add_argument("--blur_sigma", type=float, default=2.5)
@@ -907,6 +1396,20 @@ def _build_parser():
     # Input/output extras
     parser.add_argument("--remove_bg", action="store_true", help="Remove background")
     parser.add_argument(
+        "--trajectory_output",
+        type=str,
+        default=None,
+        help="Optional NPZ/prefix for read-only denoising trajectory diagnostics.",
+    )
+    parser.add_argument(
+        "--trajectory_milestones",
+        nargs="+",
+        type=float,
+        default=list(DEFAULT_TRAJECTORY_MILESTONES),
+    )
+    parser.add_argument("--config_id", type=str, default=None)
+    parser.add_argument("--input_sha256", type=str, default=None)
+    parser.add_argument(
         "--views_dir",
         type=str,
         default=None,
@@ -920,6 +1423,20 @@ def _build_parser():
         action="store_false",
     )
     parser.set_defaults(save_views=True)
+    parser.add_argument(
+        "--mask_dir",
+        type=str,
+        default=None,
+        help="Directory for per-view foreground masks (default: <output_stem>_masks).",
+    )
+    parser.add_argument("--save_masks", dest="save_masks", action="store_true")
+    parser.add_argument(
+        "--no_save_masks",
+        "--no-save-masks",
+        dest="save_masks",
+        action="store_false",
+    )
+    parser.set_defaults(save_masks=False)
     return parser
 
 
@@ -965,6 +1482,11 @@ def _validate_cli_args(parser, args):
             max_correlation=args.max_correlation,
             frequency_scale=args.frequency_scale,
             camera_length_scale=args.camera_length_scale,
+            basis_rank=args.basis_rank,
+            target_joint_kl=args.target_joint_kl,
+            rbf_length_scale_deg=args.rbf_length_scale_deg,
+            trajectory_output=args.trajectory_output,
+            trajectory_milestones=args.trajectory_milestones,
         )
     except ValueError as error:
         parser.error(str(error))
@@ -983,6 +1505,7 @@ def main():
         unet_model=args.unet_model,
         lora_model=args.lora_model,
         adapter_path=args.adapter_path,
+        mv_adapter_checkpoint=args.mv_adapter_checkpoint,
         scheduler=args.scheduler,
         num_views=num_views,
         device=args.device,
@@ -994,7 +1517,7 @@ def main():
         adapter_revision=args.adapter_revision,
     )
 
-    if args.remove_bg:
+    if args.remove_bg or args.save_masks:
         birefnet_kwargs = {"trust_remote_code": True}
         if args.birefnet_revision is not None:
             birefnet_kwargs["revision"] = args.birefnet_revision
@@ -1002,6 +1525,7 @@ def main():
             args.birefnet_model, **birefnet_kwargs
         )
         birefnet.to(args.device)
+        birefnet.eval()
         transform_image = transforms.Compose(
             [
                 transforms.Resize((1024, 1024)),
@@ -1009,13 +1533,16 @@ def main():
                 transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
             ]
         )
-        remove_bg_fn = lambda x: remove_bg(
+        segmentation_fn = lambda x: remove_bg(
             x, birefnet, transform_image, args.device
         )
+        foreground_mask_fn = lambda x: segmentation_fn(x).getchannel("A")
+        remove_bg_fn = segmentation_fn if args.remove_bg else None
     else:
         remove_bg_fn = None
+        foreground_mask_fn = None
 
-    images, reference_image = run_pipeline(
+    images, reference_image, args.run_metadata = run_pipeline(
         pipe,
         num_views=num_views,
         text=args.text,
@@ -1050,15 +1577,31 @@ def main():
         max_correlation=args.max_correlation,
         frequency_scale=args.frequency_scale,
         camera_length_scale=args.camera_length_scale,
+        basis_rank=args.basis_rank,
+        target_joint_kl=args.target_joint_kl,
+        rbf_length_scale_deg=args.rbf_length_scale_deg,
+        trajectory_output=args.trajectory_output,
+        trajectory_milestones=args.trajectory_milestones,
+        return_run_metadata=True,
     )
     output_path, reference_path, views_dir, metadata_path = _save_outputs(
-        images, reference_image, args
+        images, reference_image, args, mask_fn=foreground_mask_fn
     )
 
     print(f"Grid: {output_path}")
     print(f"Reference: {reference_path}")
     if views_dir is not None:
         print(f"Views: {views_dir}")
+    if args.save_masks:
+        print(
+            "Masks: {}".format(
+                Path(args.mask_dir).expanduser()
+                if args.mask_dir is not None
+                else output_path.with_name(f"{output_path.stem}_masks")
+            )
+        )
+    if args.trajectory_output is not None:
+        print(f"Trajectory: {args.trajectory_output}")
     print(f"Metadata: {metadata_path}")
 
 

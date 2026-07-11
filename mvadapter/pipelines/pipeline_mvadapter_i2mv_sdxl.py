@@ -569,6 +569,18 @@ class MVAdapterI2MVSDXLPipeline(StableDiffusionXLPipeline, CustomAdapterMixin):
             latents,
         )
 
+        # Passive trajectory observers need the true scheduler input, not the
+        # raw caller-provided noise (prepare_latents applies scheduler scaling).
+        # record_initial is observation-only and its return value is ignored,
+        # so this hook cannot replace or mutate the denoising tensor.
+        if callback_on_step_end is not None and hasattr(
+            callback_on_step_end, "record_initial"
+        ):
+            initial_timestep = timesteps[0] if len(timesteps) else None
+            callback_on_step_end.record_initial(
+                latents, timestep=initial_timestep
+            )
+
         # 6. Prepare extra step kwargs. TODO: Logic should ideally just be moved out of the pipeline
         extra_step_kwargs = self.prepare_extra_step_kwargs(
             scheduler_generator if scheduler_generator is not None else generator,

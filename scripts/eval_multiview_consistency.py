@@ -73,9 +73,22 @@ REPORT_FIELDS = (
     "experiment_id",
     "code_revision",
     "input_image",
+    "input_sha256",
     "method",
     "inference_method",
     "seed",
+    "config_id",
+    "rank",
+    "target_kl",
+    "achieved_kl",
+    "alpha",
+    "rbf_length_scale_deg",
+    "basis_checksum",
+    "covariance_checksum",
+    "distribution_gate_passed",
+    "selection_status",
+    "diagnostic_only",
+    "metadata_config_conflicts",
     "max_correlation",
     "frequency_scale",
     "camera_length_scale",
@@ -90,12 +103,40 @@ AGGREGATE_GROUP_FIELDS = (
     "code_revision",
     "method",
     "inference_method",
+    "config_id",
+    "rank",
+    "target_kl",
+    "achieved_kl",
+    "alpha",
+    "rbf_length_scale_deg",
+    "basis_checksum",
+    "covariance_checksum",
+    "distribution_gate_passed",
+    "selection_status",
+    "diagnostic_only",
     "max_correlation",
     "frequency_scale",
     "camera_length_scale",
     "nile_mode",
     "nile_callback",
     "rho_geo",
+)
+
+IMMUTABLE_MANIFEST_FIELDS = (
+    "run_id",
+    "experiment_id",
+    "code_revision",
+    "input_image",
+    "input_sha256",
+    "method",
+    "seed",
+    "config_id",
+    "rank",
+    "target_kl",
+    "rbf_length_scale_deg",
+    "distribution_gate_passed",
+    "selection_status",
+    "diagnostic_only",
 )
 
 
@@ -274,6 +315,15 @@ def _normalize_metadata(metadata: Mapping[str, Any]) -> Dict[str, Any]:
         "max_correlation": ("max_correlation",),
         "frequency_scale": ("frequency_scale",),
         "camera_length_scale": ("camera_length_scale",),
+        "config_id": ("config_id",),
+        "rank": ("rank", "basis_rank"),
+        "target_kl": ("target_kl", "target_joint_kl"),
+        "achieved_kl": ("achieved_kl",),
+        "alpha": ("alpha",),
+        "rbf_length_scale_deg": ("rbf_length_scale_deg",),
+        "basis_checksum": ("basis_checksum",),
+        "covariance_checksum": ("covariance_checksum",),
+        "distribution_gate_passed": ("distribution_gate_passed",),
     }
     for destination, candidates in distribution_aliases.items():
         if destination in normalized:
@@ -282,7 +332,7 @@ def _normalize_metadata(metadata: Mapping[str, Any]) -> Dict[str, Any]:
             if candidate in distribution:
                 normalized[destination] = distribution[candidate]
                 break
-    input_value = normalized.get("input")
+    input_value = normalized.get("input", normalized.get("input_path"))
     if isinstance(input_value, Mapping):
         input_value = input_value.get("image", input_value.get("path"))
     if input_value is not None:
@@ -318,9 +368,23 @@ def _sample_from_metadata(path: Path, inherited: Optional[Mapping[str, Any]] = N
         metadata = json.load(handle)
     if not isinstance(metadata, dict):
         raise ValueError("Metadata JSON must contain an object: {}".format(path))
-    combined: Dict[str, Any] = dict(inherited or {})
-    combined.update(metadata)
-    combined = _normalize_metadata(combined)
+    inherited_normalized = _normalize_metadata(dict(inherited or {}))
+    metadata_normalized = _normalize_metadata(metadata)
+    combined: Dict[str, Any] = dict(inherited_normalized)
+    combined.update(metadata_normalized)
+    conflicts: Dict[str, Dict[str, Any]] = {}
+    for field in IMMUTABLE_MANIFEST_FIELDS:
+        if field not in inherited_normalized:
+            continue
+        if field in metadata_normalized and metadata_normalized[field] != inherited_normalized[field]:
+            conflicts[field] = {
+                "manifest": inherited_normalized[field],
+                "metadata": metadata_normalized[field],
+            }
+        # The manifest is the frozen experiment plan and therefore canonical.
+        combined[field] = inherited_normalized[field]
+    if conflicts:
+        combined["metadata_config_conflicts"] = conflicts
     base = path.parent
 
     view_paths: List[Path] = []
