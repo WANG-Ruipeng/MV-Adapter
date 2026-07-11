@@ -306,6 +306,11 @@ class NileLowrankNotebookContractTests(unittest.TestCase):
         self.assertIn("L4", self.joined)
         self.assertIn("FINAL_STATUS.json", self.sources[-1])
 
+    def test_result_display_has_no_unary_plus_string(self):
+        display_source = self.sources[17]
+        self.assertNotIn('+                "| alpha"', display_source)
+        self.assertIn('"| alpha", row.get("alpha")', display_source)
+
 
 if __name__ == "__main__":
     unittest.main()
