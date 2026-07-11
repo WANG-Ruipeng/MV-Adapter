@@ -7,10 +7,8 @@ from datetime import datetime
 from typing import List, Optional, Union
 
 import numpy as np
-import nvdiffrast.torch as dr
 import torch
 import torch.nn.functional as F
-import trimesh
 from PIL import Image
 from torch import BoolTensor, FloatTensor
 

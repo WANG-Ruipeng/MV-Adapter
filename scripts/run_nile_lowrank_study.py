@@ -1076,6 +1076,16 @@ def _merge_worker_events(
     return latest, terminal_ids
 
 
+def _latest_worker_fatal_event(
+    events_path: Path, after_sequence: int
+) -> Optional[Dict[str, Any]]:
+    fatal = None
+    for event in _read_worker_events(events_path, after_sequence):
+        if event.get("event") in {"plan_rejected", "model_load_failed"}:
+            fatal = dict(event)
+    return fatal
+
+
 def _execute_persistent_worker(
     *,
     executable: Sequence[Dict[str, Any]],
@@ -1188,6 +1198,12 @@ def _execute_persistent_worker(
     except Exception as error:
         launch_error = repr(error)
 
+    fatal_event = _latest_worker_fatal_event(events_path, start_sequence)
+    try:
+        worker_log_tail = log_path.read_text(encoding="utf-8")[-12000:]
+    except Exception:
+        worker_log_tail = ""
+
     for record in executable:
         run_id = str(record["run_id"])
         # Terminal events are merged before the subprocess return code is
@@ -1209,7 +1225,18 @@ def _execute_persistent_worker(
             _copy_distribution_metadata(record)
         else:
             record["status"] = "failed"
-            if integrity.get("complete") and not freshness.get("refreshed"):
+            if fatal_event is not None:
+                failure_kind = str(fatal_event.get("event"))
+                failure_error = str(fatal_event.get("error") or "unknown worker error")
+                record["error"] = "{}: {}".format(failure_kind, failure_error)
+                record["traceback"] = str(fatal_event.get("traceback", ""))[-12000:]
+                record["worker_failure_event"] = fatal_event
+                record["oom"] = "out of memory" in failure_error.lower()
+                record["artifact_integrity"] = {
+                    "complete": False,
+                    "issues": ["worker_{}".format(failure_kind)],
+                }
+            elif integrity.get("complete") and not freshness.get("refreshed"):
                 record["error"] = (
                     "worker exited without terminal event and the complete bundle "
                     "was not fully refreshed by this invocation; returncode={}, "
@@ -1249,6 +1276,8 @@ def _execute_persistent_worker(
         "worker_plan_path": str(worker_plan_path),
         "worker_events_path": str(events_path),
         "worker_log_path": str(log_path),
+        "worker_log_tail": worker_log_tail,
+        "worker_fatal_event": fatal_event,
         "succeeded": sum(item.get("status") == "succeeded" for item in final_records),
         "artifact_complete": sum(
             item.get("status") == "succeeded"

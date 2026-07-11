@@ -255,7 +255,10 @@ class NileLowrankNotebookContractTests(unittest.TestCase):
             '"would_execute": pilot_preview.get("would_execute")',
             '"estimated_output_bytes": pilot_preview.get("estimated_output_bytes")',
             "pilot_manifest_after != pilot_manifest_before",
-            'run_stage("pilot")',
+            'pilot_run_result = run_stage("pilot", capture_output=True)',
+            'print("PILOT failure diagnostics:")',
+            'pilot_stage.get("worker_fatal_event")',
+            'print("Worker log tail:")',
         ):
             self.assertIn(literal, source)
 

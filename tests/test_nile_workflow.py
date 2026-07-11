@@ -588,6 +588,45 @@ class PersistentWorkerMergeTests(unittest.TestCase):
         self.assertEqual(observed["worker_returncode"], 137)
         self.assertEqual(saved["worker_returncode"], 137)
 
+    def test_model_load_failure_is_propagated_to_every_manifest_record(self):
+        config = _config()
+        config["runtime"]["model_load_strategy"] = "persistent_worker"
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            record = _worker_record(root, "model-load-failure")
+            process = mock.Mock()
+            process.poll.return_value = 1
+
+            def launch(*args, **kwargs):
+                events = root / "pilot" / "worker_events.jsonl"
+                events.write_text(
+                    json.dumps(
+                        {
+                            "sequence": 1,
+                            "event": "model_load_failed",
+                            "error_type": "RuntimeError",
+                            "error": "CUDA out of memory while loading BiRefNet",
+                            "traceback": "model load traceback",
+                        }
+                    )
+                    + "\n",
+                    encoding="utf-8",
+                )
+                return process
+
+            result, observed, saved = self._execute(
+                root, record, config, launch
+            )
+
+        self.assertEqual(result["failed"], 1)
+        self.assertEqual(
+            result["worker_fatal_event"]["event"], "model_load_failed"
+        )
+        self.assertIn("CUDA out of memory", observed["error"])
+        self.assertEqual(observed["traceback"], "model load traceback")
+        self.assertTrue(observed["oom"])
+        self.assertEqual(saved["worker_failure_event"]["event"], "model_load_failed")
+
     def test_partial_directory_refresh_cannot_recover_stale_views_and_masks(self):
         config = _config()
         config["runtime"]["model_load_strategy"] = "persistent_worker"
