@@ -360,6 +360,24 @@ def _normalize_metadata(metadata: Mapping[str, Any]) -> Dict[str, Any]:
             if candidate in distribution:
                 normalized[destination] = distribution[candidate]
                 break
+    method = str(normalized.get("method", distribution.get("method", "")))
+    # Older persistent-worker artifacts stored inference-call placeholders in
+    # fields that are not parameters of these methods. Canonicalize only the
+    # exact known placeholders; other unexpected values remain visible to the
+    # manifest conflict audit.
+    if method == "iid_external" and normalized.get("target_kl") is None:
+        normalized["target_kl"] = 0.0
+    if (
+        method
+        in {
+            "iid_external",
+            "shared_full",
+            "lowrank_nested_tree_a",
+            "lowrank_nested_tree_ab",
+        }
+        and normalized.get("rbf_length_scale_deg") == 90.0
+    ):
+        normalized["rbf_length_scale_deg"] = None
     input_value = normalized.get("input", normalized.get("input_path"))
     if isinstance(input_value, Mapping):
         input_value = input_value.get("image", input_value.get("path"))

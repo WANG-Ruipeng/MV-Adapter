@@ -288,6 +288,32 @@ class PersistentWorkerContractTests(unittest.TestCase):
             self.assertEqual(names.count("run_succeeded"), 2)
             self.assertEqual(names[-1], "worker_finished")
 
+    def test_saved_metadata_uses_plan_not_inference_placeholders(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            record = _record(root, "iid", 1)
+            plan_path = _write_plan(root, [record])
+            event_path = root / "events.jsonl"
+            backend = MockBackend()
+            with JsonlEventWriter(event_path) as writer:
+                result = PersistentInferenceWorker(
+                    load_worker_plan(plan_path), writer, backend=backend
+                ).run()
+
+            self.assertEqual(result["succeeded"], 1)
+            self.assertEqual(backend.run_calls[0]["basis_rank"], 8)
+            self.assertEqual(backend.run_calls[0]["target_joint_kl"], 1.0)
+            self.assertEqual(
+                backend.run_calls[0]["rbf_length_scale_deg"], 90.0
+            )
+            metadata = json.loads(
+                Path(record["metadata_path"]).read_text(encoding="utf-8")
+            )
+            distribution = metadata["distribution"]
+            self.assertIsNone(distribution["basis_rank"])
+            self.assertEqual(distribution["target_joint_kl"], 0.0)
+            self.assertIsNone(distribution["rbf_length_scale_deg"])
+
     def test_oom_retries_once_without_parameter_changes(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

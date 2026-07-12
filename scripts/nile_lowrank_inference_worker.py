@@ -688,7 +688,27 @@ class PersistentInferenceWorker:
         images, reference_image, run_metadata = self.backend.run_pipeline(
             **pipeline_kwargs
         )
-        args.run_metadata = dict(run_metadata)
+        saved_run_metadata = dict(run_metadata)
+        saved_distribution = dict(
+            saved_run_metadata.get("distribution") or {}
+        )
+        saved_distribution.update(
+            {
+                "basis_rank": record.get("rank"),
+                "target_joint_kl": record.get("target_kl"),
+                "rbf_length_scale_deg": record.get(
+                    "rbf_length_scale_deg"
+                ),
+            }
+        )
+        saved_run_metadata["distribution"] = saved_distribution
+        args.run_metadata = saved_run_metadata
+        # The inference call above needs concrete defaults, while the saved
+        # artifact must retain the frozen scientific plan, including null for
+        # parameters that do not apply to a method.
+        args.basis_rank = record.get("rank")
+        args.target_joint_kl = record.get("target_kl")
+        args.rbf_length_scale_deg = record.get("rbf_length_scale_deg")
         self.backend.save_outputs(images, reference_image, args, self.mask_fn)
         integrity = audit_artifact_bundle(record, self.plan.resolved_config)
         if not integrity["complete"]:

@@ -396,6 +396,52 @@ class TestMultiviewEvaluationWorkflow(unittest.TestCase):
         self.assertTrue(np.all(batch[0, 0] == -1.0))
         self.assertTrue(np.all(batch[0, 1] == 1.0))
 
+    def test_legacy_non_rbf_placeholders_are_canonicalized_narrowly(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            metadata_path = Path(temporary_directory) / "grid_metadata.json"
+            metadata_path.write_text(
+                json.dumps(
+                    {
+                        "method": "iid_external",
+                        "distribution": {
+                            "method": "iid_external",
+                            "basis_rank": None,
+                            "target_joint_kl": None,
+                            "rbf_length_scale_deg": 90.0,
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+            sample = eval_multiview_consistency._sample_from_metadata(
+                metadata_path,
+                {
+                    "method": "iid_external",
+                    "rank": None,
+                    "target_kl": 0.0,
+                    "rbf_length_scale_deg": None,
+                },
+            )
+            self.assertNotIn("metadata_config_conflicts", sample.metadata)
+            self.assertEqual(sample.metadata["target_kl"], 0.0)
+            self.assertIsNone(sample.metadata["rbf_length_scale_deg"])
+
+            legacy_tree = eval_multiview_consistency._normalize_metadata(
+                {
+                    "method": "lowrank_nested_tree_a",
+                    "distribution": {"rbf_length_scale_deg": 90.0},
+                }
+            )
+            self.assertIsNone(legacy_tree["rbf_length_scale_deg"])
+
+            unexpected = eval_multiview_consistency._normalize_metadata(
+                {
+                    "method": "lowrank_nested_tree_a",
+                    "distribution": {"rbf_length_scale_deg": 45.0},
+                }
+            )
+            self.assertEqual(unexpected["rbf_length_scale_deg"], 45.0)
+
     def test_featup_torch_hub_trust_is_noninteractive_and_scoped(self):
         calls = []
 
