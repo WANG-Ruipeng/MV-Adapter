@@ -250,6 +250,20 @@ class NileLowrankNotebookContractTests(unittest.TestCase):
         self.assertNotIn('pilot_manifest.get("records"', self.joined)
         self.assertNotIn('full_manifest.get("records"', self.joined)
 
+    def test_pilot_evaluation_prints_and_stops_on_precise_failure(self):
+        source = self.sources[10]
+        for literal in (
+            "PILOT EVALUATION FAILURE DIAGNOSTICS",
+            '"met3r_provenance_error"',
+            '"base_evaluator_returncode"',
+            '"evaluation_completeness"',
+            '"evaluate_pilot"',
+            '"evaluator_log"',
+            "Evaluator log tail:",
+            "diagnostics printed above",
+        ):
+            self.assertIn(literal, source)
+
     def test_test_results_schema_is_atomic(self):
         for literal in (
             '"passed"',

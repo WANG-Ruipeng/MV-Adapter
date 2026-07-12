@@ -2200,7 +2200,31 @@ def run_evaluation_stage(
         evaluation.get("identity_model_revision"),
     )
     _add_optional(command, "--met3r-revision", evaluation.get("met3r_revision"))
-    process = subprocess.run(command, check=False)
+    process = subprocess.run(
+        command,
+        check=False,
+        text=True,
+        capture_output=True,
+    )
+    evaluator_stdout = str(getattr(process, "stdout", "") or "")
+    evaluator_stderr = str(getattr(process, "stderr", "") or "")
+    evaluator_log = output_dir / "evaluator.log"
+    _atomic_text(
+        evaluator_log,
+        "\n".join(
+            [
+                "COMMAND " + json.dumps(command, ensure_ascii=False),
+                "RETURN_CODE " + str(process.returncode),
+                "",
+                "=== STDOUT ===",
+                evaluator_stdout.rstrip() or "<empty>",
+                "",
+                "=== STDERR ===",
+                evaluator_stderr.rstrip() or "<empty>",
+                "",
+            ]
+        ),
+    )
     metrics_path = output_dir / "lowrank_metrics.json"
     metrics_payload: Dict[str, Any] = {}
     if metrics_path.exists():
@@ -2253,6 +2277,9 @@ def run_evaluation_stage(
         "guardrails_complete": guardrails_complete,
         "payload_formal_evaluation_complete": payload_formal_complete,
         "plots_dir": str(root / "plots" / split),
+        "evaluator_log": str(evaluator_log),
+        "stdout_tail": evaluator_stdout[-12000:],
+        "stderr_tail": evaluator_stderr[-12000:],
     }
 
 

@@ -101,12 +101,29 @@ class EvaluationAngleBinWiringTests(unittest.TestCase):
             manifest.write_text(json.dumps({"runs": []}), encoding="utf-8")
             with mock.patch(
                 "scripts.run_nile_lowrank_study.subprocess.run",
-                return_value=SimpleNamespace(returncode=1),
+                return_value=SimpleNamespace(
+                    returncode=1,
+                    stdout="evaluator stdout",
+                    stderr="precise evaluator failure",
+                ),
             ) as mocked_run:
-                run_evaluation_stage(root, "pilot", config)
+                result = run_evaluation_stage(root, "pilot", config)
+                evaluator_log = (
+                    root / "metrics" / "pilot" / "evaluator.log"
+                ).read_text(encoding="utf-8")
         command = mocked_run.call_args.args[0]
         start = command.index("--angle-bins-deg") + 1
         self.assertEqual(command[start : start + 3], ["30.0", "75.0", "150.0"])
+        self.assertTrue(mocked_run.call_args.kwargs["capture_output"])
+        self.assertTrue(mocked_run.call_args.kwargs["text"])
+        self.assertIn("RETURN_CODE 1", evaluator_log)
+        self.assertIn("evaluator stdout", evaluator_log)
+        self.assertIn("precise evaluator failure", evaluator_log)
+        self.assertEqual(result["stderr_tail"], "precise evaluator failure")
+        self.assertEqual(
+            result["evaluator_log"],
+            str(root / "metrics" / "pilot" / "evaluator.log"),
+        )
 
     def test_study_evaluator_passes_cli_angle_bins_to_base_evaluator(self):
         observed_commands = []
