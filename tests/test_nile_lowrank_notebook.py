@@ -172,6 +172,12 @@ class NileLowrankNotebookContractTests(unittest.TestCase):
         )
         self.assertIn("timm/BiRefNet import smoke test:", self.sources[3])
         self.assertIn(
+            "install_featup_torch_hub_trust", self.sources[3]
+        )
+        self.assertIn(
+            "FeatUp torch.hub trust smoke test:", self.sources[3]
+        )
+        self.assertIn(
             "git+https://github.com/mohammadasim98/met3r@", self.joined
         )
         self.assertIn(

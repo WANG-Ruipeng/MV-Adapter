@@ -396,6 +396,37 @@ class TestMultiviewEvaluationWorkflow(unittest.TestCase):
         self.assertTrue(np.all(batch[0, 0] == -1.0))
         self.assertTrue(np.all(batch[0, 1] == 1.0))
 
+    def test_featup_torch_hub_trust_is_noninteractive_and_scoped(self):
+        calls = []
+
+        def fake_load(*args, **kwargs):
+            calls.append((args, dict(kwargs)))
+            return "loaded"
+
+        class FakeHub:
+            load = staticmethod(fake_load)
+
+        class FakeTorch:
+            hub = FakeHub()
+
+        mode = eval_multiview_consistency.install_featup_torch_hub_trust(
+            FakeTorch
+        )
+        self.assertEqual(mode, "trust_repo_true_for_mhamilton723_FeatUp")
+        FakeTorch.hub.load("mhamilton723/FeatUp", "dinov2")
+        FakeTorch.hub.load("mhamilton723/FeatUp:main", "dinov2")
+        FakeTorch.hub.load("another/repository", "model")
+
+        self.assertIs(calls[0][1]["trust_repo"], True)
+        self.assertIs(calls[1][1]["trust_repo"], True)
+        self.assertNotIn("trust_repo", calls[2][1])
+        self.assertEqual(
+            eval_multiview_consistency.install_featup_torch_hub_trust(
+                FakeTorch
+            ),
+            "already_installed",
+        )
+
     def test_r_hf_uses_iid_default_per_angle_and_emits_guardrail_labels(self):
         rows = [
             {

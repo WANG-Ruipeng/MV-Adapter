@@ -41,6 +41,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import functools
 import glob
 import hashlib
 import json
@@ -138,6 +139,33 @@ IMMUTABLE_MANIFEST_FIELDS = (
     "selection_status",
     "diagnostic_only",
 )
+
+FEATUP_TORCH_HUB_REPOSITORY = "mhamilton723/FeatUp"
+
+
+def install_featup_torch_hub_trust(torch_module: Any) -> str:
+    """Trust only the official FeatUp torch.hub repository non-interactively.
+
+    PyTorch 2.11 checks its local torch.hub trust list by default and prompts for
+    confirmation when the repository is absent. The evaluator runs in a
+    non-interactive subprocess, so that prompt otherwise fails with EOF.
+    """
+
+    current_load = torch_module.hub.load
+    if getattr(current_load, "_mvadapter_featup_trust", False):
+        return "already_installed"
+
+    @functools.wraps(current_load)
+    def trusted_load(*args: Any, **kwargs: Any) -> Any:
+        repository = args[0] if args else kwargs.get("repo_or_dir")
+        repository_name = str(repository).split(":", 1)[0]
+        if repository_name == FEATUP_TORCH_HUB_REPOSITORY:
+            kwargs["trust_repo"] = True
+        return current_load(*args, **kwargs)
+
+    setattr(trusted_load, "_mvadapter_featup_trust", True)
+    torch_module.hub.load = trusted_load
+    return "trust_repo_true_for_mhamilton723_FeatUp"
 
 
 @dataclass
@@ -778,6 +806,7 @@ class Met3rBackend:
             raise RuntimeError("{}\nOriginal import error: {}".format(self.INSTALL_GUIDANCE, error)) from error
 
         self.torch = torch
+        install_featup_torch_hub_trust(torch)
         self.device = args.met3r_device
         self.input_size = args.met3r_image_size
         self.distance = args.met3r_distance
