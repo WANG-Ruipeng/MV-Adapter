@@ -1531,6 +1531,62 @@ class EvaluationPairingTests(unittest.TestCase):
         self.assertEqual(rows[1]["status"], "generation_failed")
         self.assertEqual(audit["missing_evaluation_run_ids"], ["two"])
 
+    def test_manifest_reconciliation_removes_only_exact_legacy_placeholders(self):
+        manifest = [
+            {
+                "run_id": "iid",
+                "status": "succeeded",
+                "method": "iid_external",
+                "target_kl": 0.0,
+                "rbf_length_scale_deg": None,
+            },
+            {
+                "run_id": "tree",
+                "status": "succeeded",
+                "method": "lowrank_nested_tree_a",
+                "target_kl": 5.0,
+                "rbf_length_scale_deg": None,
+            },
+        ]
+        evaluated = [
+            {
+                "sample_id": "iid",
+                "status": "succeeded",
+                "method": "iid_external",
+                "target_kl": 0.0,
+                "rbf_length_scale_deg": None,
+                "metadata_config_conflicts": {
+                    "target_kl": {"manifest": 0.0, "metadata": None},
+                    "rbf_length_scale_deg": {
+                        "manifest": None,
+                        "metadata": 90.0,
+                    },
+                },
+            },
+            {
+                "sample_id": "tree",
+                "status": "succeeded",
+                "method": "lowrank_nested_tree_a",
+                "target_kl": 5.0,
+                "rbf_length_scale_deg": None,
+                "metadata_config_conflicts": {
+                    "rbf_length_scale_deg": {
+                        "manifest": None,
+                        "metadata": 45.0,
+                    }
+                },
+            },
+        ]
+
+        rows, audit = reconcile_manifest_samples(manifest, evaluated)
+
+        self.assertNotIn("metadata_config_conflicts", rows[0])
+        self.assertEqual(
+            rows[1]["metadata_config_conflicts"]["rbf_length_scale_deg"],
+            {"manifest": None, "metadata": 45.0},
+        )
+        self.assertEqual(audit["metadata_conflict_run_ids"], ["tree"])
+
     def test_met3r_revision_uses_pep610_commit(self):
         fake_distribution = mock.Mock()
         fake_distribution.version = "0.1"

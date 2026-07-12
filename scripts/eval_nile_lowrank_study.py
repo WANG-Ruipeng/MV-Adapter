@@ -72,6 +72,34 @@ CANONICAL_RUN_FIELDS = (
     "diagnostic_only",
 )
 
+LEGACY_NON_RBF_PLACEHOLDER_METHODS = {
+    "iid_external",
+    "shared_full",
+    "lowrank_nested_tree_a",
+    "lowrank_nested_tree_ab",
+}
+
+
+def _remove_legacy_placeholder_conflicts(
+    record: Mapping[str, Any], conflicts: Mapping[str, Any]
+) -> Dict[str, Any]:
+    """Remove only exact stale conflicts emitted by the old worker metadata."""
+
+    cleaned = dict(conflicts)
+    method = str(record.get("method", ""))
+    if method == "iid_external" and cleaned.get("target_kl") == {
+        "manifest": 0.0,
+        "metadata": None,
+    }:
+        cleaned.pop("target_kl")
+    if (
+        method in LEGACY_NON_RBF_PLACEHOLDER_METHODS
+        and cleaned.get("rbf_length_scale_deg")
+        == {"manifest": None, "metadata": 90.0}
+    ):
+        cleaned.pop("rbf_length_scale_deg")
+    return cleaned
+
 
 def reconcile_manifest_samples(
     manifest_rows: Sequence[Mapping[str, Any]],
@@ -108,7 +136,9 @@ def reconcile_manifest_samples(
                 duplicate_ids.append(run_id)
         row["generation_status"] = record.get("status")
         row["run_id"] = run_id
-        config_conflicts = dict(row.get("metadata_config_conflicts") or {})
+        config_conflicts = _remove_legacy_placeholder_conflicts(
+            record, dict(row.get("metadata_config_conflicts") or {})
+        )
         for field in CANONICAL_RUN_FIELDS:
             if field not in record:
                 continue
@@ -121,6 +151,8 @@ def reconcile_manifest_samples(
         if config_conflicts:
             row["metadata_config_conflicts"] = config_conflicts
             conflict_ids.append(run_id)
+        else:
+            row.pop("metadata_config_conflicts", None)
         if record.get("status") != "succeeded":
             row["status"] = "generation_{}".format(record.get("status", "unknown"))
         reconciled.append(row)
